@@ -1,0 +1,27 @@
+{
+  "name": "notion-intel-scanner",
+  "version": "1.0.0",
+  "description": "Automated daily news scanner that creates Notion signals for cannabis accessories business intelligence",
+  "main": "scanner.js",
+  "scripts": {
+    "scan": "node scanner.js",
+    "test": "node scanner.js --dry-run"
+  },
+  "dependencies": {
+    "@notionhq/client": "^2.2.14",
+    "rss-parser": "^3.13.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "notion",
+    "intel",
+    "cannabis",
+    "news",
+    "scanner",
+    "automation"
+  ],
+  "author": "",
+  "license": "MIT"
+}
