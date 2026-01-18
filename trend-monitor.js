@@ -215,6 +215,16 @@ async function fetchActiveMonitors() {
       const interval = props.interval?.select?.name || 'week';
       const lastCheck = props.last_check?.date?.start || null;
 
+      // Read existing scores for historical tracking
+      const previousTrendScore = props.trend_score?.number || null;
+      const previousCoherence = props.Coherency?.number || props.coherence?.number || null;
+      const previousConfidence = props.confidence?.number || null;
+
+      // Pre-populate score history if we have previous scores
+      if (previousTrendScore !== null) {
+        scoreHistory.set(monitorId, previousTrendScore);
+      }
+
       monitors.push({
         pageId: page.id,
         monitorId,
@@ -222,6 +232,9 @@ async function fetchActiveMonitors() {
         threshold,
         interval,
         lastCheck,
+        previousTrendScore,
+        previousCoherence,
+        previousConfidence,
       });
     }
 
@@ -234,10 +247,14 @@ async function fetchActiveMonitors() {
 
 /**
  * Update monitor in Notion with trend results
+ * Writes: last_check, trend_score, coherence, confidence
  */
 async function updateMonitor(pageId, results) {
   if (DRY_RUN) {
-    console.log(`  [DRY RUN] Would update monitor ${pageId}`);
+    console.log(`  [DRY RUN] Would update monitor ${pageId} with:`);
+    console.log(`    - trend_score: ${results.trendScore}`);
+    console.log(`    - coherence: ${results.coherenceScore}`);
+    console.log(`    - confidence: ${results.confidence}`);
     return true;
   }
 
@@ -246,13 +263,41 @@ async function updateMonitor(pageId, results) {
       'last_check': { date: { start: new Date().toISOString().split('T')[0] } },
     };
 
+    // Add score properties if they exist in results
+    // Note: Property names must match exactly what's in Notion database
+    if (results.trendScore !== undefined) {
+      properties['trend_score'] = { number: results.trendScore };
+    }
+    if (results.coherenceScore !== undefined) {
+      // Try both "coherence" and "Coherency" (Notion property names are case-sensitive)
+      properties['Coherency'] = { number: results.coherenceScore };
+    }
+    if (results.confidence !== undefined) {
+      properties['confidence'] = { number: results.confidence };
+    }
+    // Also store change percentage for historical tracking
+    if (results.changePercent !== undefined) {
+      properties['change_percent'] = { number: results.changePercent };
+    }
+
     await notionRequest(() => notion.pages.update({
       page_id: pageId,
       properties,
     }));
     return true;
   } catch (error) {
-    console.error(`  Warning: Error updating monitor: ${error.message}`);
+    // If property doesn't exist, log warning with details
+    if (error.message?.includes('property does not exist') || error.code === 'validation_error') {
+      console.error(`  Warning: Some score properties may not exist in your Notion database.`);
+      console.error(`  Please add these Number properties to your Trend Monitors database:`);
+      console.error(`    - trend_score (Number) - stores the calculated trend score 0-100`);
+      console.error(`    - Coherency (Number) - stores the coherence score 0-100`);
+      console.error(`    - confidence (Number) - stores the confidence 0.0-1.0`);
+      console.error(`    - change_percent (Number) - stores the % change from previous`);
+      console.error(`  Error: ${error.message}`);
+    } else {
+      console.error(`  Warning: Error updating monitor: ${error.message}`);
+    }
     return false;
   }
 }
