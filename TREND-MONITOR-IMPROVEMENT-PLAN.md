@@ -13,6 +13,43 @@ This document provides a prioritized roadmap for improving trend monitoring scor
 
 ---
 
+## Implementation Status
+
+### Phase 1: COMPLETED (2025-01-18)
+
+All Phase 1 improvements have been implemented in `trend-monitor.js` v2.0.0:
+
+| Item | Status | Implementation |
+|------|--------|----------------|
+| 1.1 Historical Score Persistence | DONE | `scoreHistory` Map with per-monitor tracking |
+| 1.2 Term Matching | PARTIAL | Basic implementation (fuzzy matching planned for Phase 3) |
+| 1.3 Weighted Source Scoring | DONE | `SOURCE_WEIGHTS` configuration with reliability weights |
+| 1.4 Multi-Region Trends | DONE | US, GB, CA, AU via `GOOGLE_TRENDS_REGIONS` |
+| 1.5 Article Recency Weighting | DONE | Exponential decay with `calculateRecencyWeight()` |
+| 1.6 Confidence Intervals | DONE | `calculateConfidenceV2()` with multipliers |
+| 1.7 Score Smoothing | DONE | EMA implementation with `EMA_ALPHA = 0.3` |
+
+**Additional Features Implemented:**
+- **Coherence Score (NEW)**: 4-factor metric measuring signal reliability
+- **Trend Score v2**: 6-factor scoring (velocity, momentum, sentiment, relevance, authority, recency)
+- **Enhanced Alerts**: Include factor breakdowns and coherence levels
+
+See [CHANGELOG.md](./CHANGELOG.md) for full release notes.
+
+### Phase 2: PLANNED
+- Wikipedia Pageviews API
+- Reddit API
+- Hacker News API
+- Industry RSS feeds
+
+### Phase 3: PLANNED
+- Historical trend database
+- Predictive scoring
+- Anomaly detection
+- Semantic term expansion
+
+---
+
 ## Phase 1: Quick Wins (No New APIs Needed)
 
 These improvements use existing data sources and can be implemented immediately.

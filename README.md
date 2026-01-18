@@ -116,6 +116,84 @@ npm run scan
 - **Check logs**: Click any workflow run
 - **New signals**: Look for 📰 emoji in your Notion database
 
+---
+
+## Trend Monitor v2
+
+In addition to daily scanning, this repo includes an advanced **Trend Monitor** that tracks search terms across multiple data sources with multi-factor scoring.
+
+### Features
+
+- **Multi-region Google Trends** (US, GB, CA, AU)
+- **6-Factor Trend Scoring**: Velocity, Momentum, Sentiment, Relevance, Authority, Recency
+- **Coherence Score**: Measures signal reliability (0-100)
+- **EMA Smoothing**: Reduces noise in trend detection
+- **Automatic Alerts**: Creates Notion signals when thresholds exceeded
+
+### Trend Monitor Setup
+
+#### Additional Secret Required
+
+| Secret | Description |
+|--------|-------------|
+| `MONITORS_DATABASE_ID` | Notion database ID for trend monitors |
+
+#### Optional Secrets for Enhanced Data
+
+| Secret | Description | Free Tier |
+|--------|-------------|-----------|
+| `NEWSDATA_API_KEY` | NewsData.io API | 200 credits/day |
+| `SERPAPI_KEY` | Google News via SerpAPI | 100 searches/month |
+
+### Scoring System
+
+#### Trend Score v2 (0-100)
+
+| Factor | Weight | Description |
+|--------|--------|-------------|
+| Velocity | 20% | Rate of change from previous |
+| Momentum | 20% | Sustained interest across regions |
+| Sentiment | 10% | Positive vs negative signal |
+| Relevance | 20% | Term match in trending topics |
+| Authority | 15% | Source credibility weighted |
+| Recency | 15% | Article freshness |
+
+#### Coherence Score (0-100)
+
+Measures how reliable the trend signal is:
+
+| Level | Score | Action |
+|-------|-------|--------|
+| High | 75-100 | Signal reliable - act on trend |
+| Medium | 50-74 | Some consistency - verify first |
+| Low | 25-49 | Weak signal - do not act |
+| Noise | 0-24 | Disregard - likely false positive |
+
+### Running Trend Monitor
+
+```bash
+# Dry run (no updates)
+npm run trends:test
+
+# Real run
+npm run trends
+
+# Verbose mode (show all factors)
+VERBOSE=true npm run trends
+```
+
+### Documentation
+
+- [SCORING-IMPROVEMENTS.md](./SCORING-IMPROVEMENTS.md) - Scoring system overview
+- [TREND-MONITOR-IMPROVEMENT-PLAN.md](./TREND-MONITOR-IMPROVEMENT-PLAN.md) - Detailed implementation plan
+- [CHANGELOG.md](./CHANGELOG.md) - Version history
+
+---
+
+## Environment Variables
+
+See [.env.example](./.env.example) for all available configuration options.
+
 ## License
 
 MIT
