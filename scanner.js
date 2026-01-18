@@ -51,7 +51,6 @@ const RSS_FEEDS = [
 
   // Regulation
   { name: 'Tobacco Reporter', url: 'https://tobaccoreporter.com/feed/', category: 'regulation' },
-  { name: 'TTB Announcements', url: 'https://www.ttb.gov/templates/ttb/news/announcements.xml', category: 'regulation' },
 
   // Supply Chain
   { name: 'FreightWaves', url: 'https://www.freightwaves.com/feed', category: 'supply_chain' },
@@ -178,6 +177,18 @@ function sleep(ms) {
 }
 
 /**
+ * Validate URL format
+ */
+function isValidUrl(string) {
+  try {
+    const url = new URL(string);
+    return url.protocol === 'http:' || url.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Wrapper for Notion API calls with exponential backoff for rate limiting
  */
 async function notionRequest(fn, retries = 3) {
@@ -228,7 +239,7 @@ async function fetchRSSFeeds() {
       // Small delay between feeds
       await sleep(500);
     } catch (error) {
-      console.log(`  Warning: Error fetching ${feed.name}: ${error.message}`);
+      console.error(`  Warning: Error fetching ${feed.name}: ${error.message}`);
     }
   }
 
@@ -258,6 +269,9 @@ async function fetchGoogleNews() {
       // Consider using a server-side proxy in production to avoid exposing the key in logs.
       const url = `https://serpapi.com/search.json?engine=google_news&q=${encodeURIComponent(query)}&api_key=${process.env.SERPAPI_KEY}`;
       const response = await fetch(url);
+      if (!response.ok) {
+        throw new Error(`SerpAPI returned status ${response.status}`);
+      }
       const data = await response.json();
 
       for (const item of data.news_results || []) {
@@ -366,7 +380,7 @@ async function signalExists(link) {
  * Create signal in Notion (single API call with children blocks)
  */
 async function createSignal(article) {
-  const signalId = `auto-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`;
+  const signalId = `auto-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
 
   // Safe date validation
   const timestamp = article.pubDate instanceof Date && !isNaN(article.pubDate)
@@ -445,7 +459,7 @@ async function createSignal(article) {
 
     return true;
   } catch (error) {
-    console.log(`  Warning: Error creating signal: ${error.message}`);
+    console.error(`  Warning: Error creating signal: ${error.message}`);
     return false;
   }
 }
