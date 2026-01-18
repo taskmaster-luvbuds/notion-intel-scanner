@@ -9,22 +9,23 @@
  * 4. Creates alerts when thresholds are exceeded
  *
  * Data Sources (Free Tier):
- * - Google Trends RSS (via trendspyg pattern - free, no API key)
+ * - Google Trends RSS (daily trending searches - free, no API key)
  * - NewsData.io (200 credits/day free)
  * - Google News via SerpAPI (100 searches/month free, if configured)
  *
  * Required environment variables:
  *   NOTION_TOKEN - Notion API integration token
  *   MONITORS_DATABASE_ID - Notion database ID for trend monitors
- *   SIGNALS_DATABASE_ID - Notion database ID for signals (for alerts)
  *
  * Optional:
+ *   SIGNALS_DATABASE_ID - Notion database ID for signals (for alerts)
  *   NEWSDATA_API_KEY - NewsData.io API key (free tier: 200 credits/day)
  *   SERPAPI_KEY - SerpAPI key for Google News (100 free searches/month)
  *   DRY_RUN - Set to 'true' to test without updating Notion
  */
 
 const { Client } = require('@notionhq/client');
+const Parser = require('rss-parser');
 
 // Initialize Notion client
 const notion = new Client({ auth: process.env.NOTION_TOKEN });
@@ -33,6 +34,10 @@ const notion = new Client({ auth: process.env.NOTION_TOKEN });
 const MONITORS_DB = process.env.MONITORS_DATABASE_ID;
 const SIGNALS_DB = process.env.SIGNALS_DATABASE_ID;
 const DRY_RUN = process.env.DRY_RUN === 'true' || process.argv.includes('--dry-run');
+
+// Constants
+const FETCH_TIMEOUT_MS = 10000;
+const MAX_CONTENT_LENGTH = 1900;
 
 // ============================================================================
 // HELPER FUNCTIONS
@@ -43,6 +48,38 @@ const DRY_RUN = process.env.DRY_RUN === 'true' || process.argv.includes('--dry-r
  */
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * Validate URL format
+ */
+function isValidUrl(string) {
+  try {
+    const url = new URL(string);
+    return url.protocol === 'http:' || url.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Fetch with timeout to prevent hanging requests
+ */
+async function fetchWithTimeout(url, options = {}, timeout = FETCH_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeout);
+
+  try {
+    const response = await fetch(url, { ...options, signal: controller.signal });
+    clearTimeout(timeoutId);
+    return response;
+  } catch (error) {
+    clearTimeout(timeoutId);
+    if (error.name === 'AbortError') {
+      throw new Error(`Request timed out after ${timeout}ms`);
+    }
+    throw error;
+  }
 }
 
 /**
@@ -108,7 +145,6 @@ async function fetchActiveMonitors() {
       const threshold = props.threshold?.number || 20;
       const interval = props.interval?.select?.name || 'week';
       const lastCheck = props.last_check?.date?.start || null;
-      const active = props.active?.checkbox || false;
 
       monitors.push({
         pageId: page.id,
@@ -117,7 +153,6 @@ async function fetchActiveMonitors() {
         threshold,
         interval,
         lastCheck,
-        active,
       });
     }
 
@@ -134,27 +169,50 @@ async function fetchActiveMonitors() {
 async function updateMonitor(pageId, results) {
   if (DRY_RUN) {
     console.log(`  [DRY RUN] Would update monitor ${pageId}`);
-    return;
+    return true;
   }
 
-  const properties = {
-    'last_check': { date: { start: new Date().toISOString().split('T')[0] } },
-  };
+  try {
+    const properties = {
+      'last_check': { date: { start: new Date().toISOString().split('T')[0] } },
+    };
 
-  // Add trend_score if your database has this property
-  if (results.trendScore !== undefined) {
-    properties['trend_score'] = { number: results.trendScore };
+    await notionRequest(() => notion.pages.update({
+      page_id: pageId,
+      properties,
+    }));
+    return true;
+  } catch (error) {
+    console.error(`  Warning: Error updating monitor: ${error.message}`);
+    return false;
   }
+}
 
-  // Add trend_change if your database has this property
-  if (results.trendChange !== undefined) {
-    properties['trend_change'] = { number: results.trendChange };
+/**
+ * Check if alert already exists for this monitor today
+ */
+async function alertExistsToday(monitorId) {
+  if (!SIGNALS_DB) return false;
+
+  const today = new Date().toISOString().split('T')[0];
+
+  try {
+    const response = await notionRequest(() => notion.databases.query({
+      database_id: SIGNALS_DB,
+      filter: {
+        and: [
+          { property: 'source', rich_text: { contains: monitorId } },
+          { property: 'timestamp', date: { equals: today } },
+          { property: 'signal_type', select: { equals: 'TREND' } },
+        ]
+      },
+      page_size: 1
+    }));
+    return response.results.length > 0;
+  } catch (error) {
+    console.error(`  Warning: Error checking for duplicate alert: ${error.message}`);
+    return true; // Conservative: skip rather than create duplicate
   }
-
-  await notionRequest(() => notion.pages.update({
-    page_id: pageId,
-    properties,
-  }));
 }
 
 /**
@@ -163,70 +221,77 @@ async function updateMonitor(pageId, results) {
 async function createAlert(monitor, trendData) {
   if (DRY_RUN) {
     console.log(`  [DRY RUN] Would create alert for ${monitor.monitorId}`);
-    return;
+    return true;
   }
 
-  const alertId = `trend-alert-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+  try {
+    const alertId = `trend-alert-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+    const articlesContent = (trendData.articles || 'No related articles found').substring(0, MAX_CONTENT_LENGTH);
 
-  await notionRequest(() => notion.pages.create({
-    parent: { database_id: SIGNALS_DB },
-    icon: { type: 'emoji', emoji: '📈' },
-    properties: {
-      'signal_id': { title: [{ text: { content: alertId } }] },
-      'entity': { rich_text: [{ text: { content: monitor.terms.join(', ').substring(0, 100) } }] },
-      'signal_type': { select: { name: 'TREND' } },
-      'content': { rich_text: [{ text: { content: `Trend alert: ${trendData.summary}` } }] },
-      'source': { rich_text: [{ text: { content: `Monitor: ${monitor.monitorId}` } }] },
-      'confidence': { number: trendData.confidence || 0.8 },
-      'timestamp': { date: { start: new Date().toISOString().split('T')[0] } },
-      'processed': { checkbox: false },
-    },
-    children: [
-      {
-        type: 'heading_2',
-        heading_2: { rich_text: [{ text: { content: '📈 Trend Alert' } }] }
+    await notionRequest(() => notion.pages.create({
+      parent: { database_id: SIGNALS_DB },
+      icon: { type: 'emoji', emoji: '📈' },
+      properties: {
+        'signal_id': { title: [{ text: { content: alertId } }] },
+        'entity': { rich_text: [{ text: { content: monitor.terms.join(', ').substring(0, 100) } }] },
+        'signal_type': { select: { name: 'TREND' } },
+        'content': { rich_text: [{ text: { content: `Trend alert: ${trendData.summary}`.substring(0, 200) } }] },
+        'source': { rich_text: [{ text: { content: `Monitor: ${monitor.monitorId}` } }] },
+        'confidence': { number: trendData.confidence || 0.8 },
+        'timestamp': { date: { start: new Date().toISOString().split('T')[0] } },
+        'processed': { checkbox: false },
       },
-      {
-        type: 'callout',
-        callout: {
-          icon: { type: 'emoji', emoji: '⚠️' },
-          rich_text: [{ text: { content: `Threshold exceeded: ${trendData.changePercent}% change (threshold: ${monitor.threshold}%)` } }]
-        }
-      },
-      {
-        type: 'heading_3',
-        heading_3: { rich_text: [{ text: { content: 'Monitor Details' } }] }
-      },
-      {
-        type: 'bulleted_list_item',
-        bulleted_list_item: { rich_text: [{ text: { content: `Monitor ID: ${monitor.monitorId}` } }] }
-      },
-      {
-        type: 'bulleted_list_item',
-        bulleted_list_item: { rich_text: [{ text: { content: `Terms: ${monitor.terms.join(', ')}` } }] }
-      },
-      {
-        type: 'bulleted_list_item',
-        bulleted_list_item: { rich_text: [{ text: { content: `Interval: ${monitor.interval}` } }] }
-      },
-      {
-        type: 'bulleted_list_item',
-        bulleted_list_item: { rich_text: [{ text: { content: `Trend Score: ${trendData.trendScore}` } }] }
-      },
-      {
-        type: 'bulleted_list_item',
-        bulleted_list_item: { rich_text: [{ text: { content: `Change: ${trendData.changePercent}%` } }] }
-      },
-      {
-        type: 'heading_3',
-        heading_3: { rich_text: [{ text: { content: 'Related Articles' } }] }
-      },
-      {
-        type: 'paragraph',
-        paragraph: { rich_text: [{ text: { content: trendData.articles || 'No related articles found' } }] }
-      },
-    ]
-  }));
+      children: [
+        {
+          type: 'heading_2',
+          heading_2: { rich_text: [{ text: { content: '📈 Trend Alert' } }] }
+        },
+        {
+          type: 'callout',
+          callout: {
+            icon: { type: 'emoji', emoji: '⚠️' },
+            rich_text: [{ text: { content: `Threshold exceeded: ${trendData.changePercent}% change (threshold: ${monitor.threshold}%)` } }]
+          }
+        },
+        {
+          type: 'heading_3',
+          heading_3: { rich_text: [{ text: { content: 'Monitor Details' } }] }
+        },
+        {
+          type: 'bulleted_list_item',
+          bulleted_list_item: { rich_text: [{ text: { content: `Monitor ID: ${monitor.monitorId}` } }] }
+        },
+        {
+          type: 'bulleted_list_item',
+          bulleted_list_item: { rich_text: [{ text: { content: `Terms: ${monitor.terms.join(', ')}` } }] }
+        },
+        {
+          type: 'bulleted_list_item',
+          bulleted_list_item: { rich_text: [{ text: { content: `Interval: ${monitor.interval}` } }] }
+        },
+        {
+          type: 'bulleted_list_item',
+          bulleted_list_item: { rich_text: [{ text: { content: `Trend Score: ${trendData.trendScore}` } }] }
+        },
+        {
+          type: 'bulleted_list_item',
+          bulleted_list_item: { rich_text: [{ text: { content: `Change: ${trendData.changePercent}%` } }] }
+        },
+        {
+          type: 'heading_3',
+          heading_3: { rich_text: [{ text: { content: 'Related Articles' } }] }
+        },
+        {
+          type: 'paragraph',
+          paragraph: { rich_text: [{ text: { content: articlesContent } }] }
+        },
+      ]
+    }));
+    return true;
+  } catch (error) {
+    console.error(`  Warning: Error creating alert: ${error.message}`);
+    return false;
+  }
 }
 
 // ============================================================================
@@ -234,36 +299,50 @@ async function createAlert(monitor, trendData) {
 // ============================================================================
 
 /**
- * Fetch Google Trends data via RSS feed (FREE - no API key required)
- * This mimics the trendspyg library's RSS approach
+ * Fetch Google Trends daily trending searches via RSS feed (FREE - no API key required)
+ * Note: This fetches what's trending globally, then we check if our terms appear
  */
-async function fetchGoogleTrendsRSS(geo = 'US') {
-  const Parser = require('rss-parser');
+async function fetchGoogleTrendsRSS(searchTerms, geo = 'US') {
   const parser = new Parser({
-    timeout: 10000,
+    timeout: FETCH_TIMEOUT_MS,
     headers: { 'User-Agent': 'Mozilla/5.0 (compatible; TrendMonitor/1.0)' }
   });
 
   try {
-    const url = `https://trends.google.com/trending/rss?geo=${geo}`;
+    // Correct URL for Google Trends daily RSS
+    const url = `https://trends.google.com/trends/trendingsearches/daily/rss?geo=${geo}`;
     const feed = await parser.parseURL(url);
 
-    return feed.items.map(item => ({
+    const trendingTopics = feed.items.map(item => ({
       title: item.title,
       traffic: item['ht:approx_traffic'] || 'N/A',
       pubDate: new Date(item.pubDate),
       description: item.contentSnippet || '',
     }));
+
+    // Check if any of our search terms appear in trending topics
+    const matchingTrends = trendingTopics.filter(topic =>
+      searchTerms.some(term =>
+        topic.title.toLowerCase().includes(term.toLowerCase()) ||
+        topic.description.toLowerCase().includes(term.toLowerCase())
+      )
+    );
+
+    return {
+      allTrends: trendingTopics,
+      matchingTrends,
+      hasMatches: matchingTrends.length > 0,
+    };
   } catch (error) {
     console.error(`  Warning: Google Trends RSS error: ${error.message}`);
-    return [];
+    return { allTrends: [], matchingTrends: [], hasMatches: false };
   }
 }
 
 /**
  * Fetch news volume from NewsData.io (FREE tier: 200 credits/day)
  */
-async function fetchNewsVolume(searchTerms, days = 7) {
+async function fetchNewsVolume(searchTerms) {
   if (!process.env.NEWSDATA_API_KEY) {
     return null;
   }
@@ -275,7 +354,10 @@ async function fetchNewsVolume(searchTerms, days = 7) {
       const encodedTerm = encodeURIComponent(term);
       const url = `https://newsdata.io/api/1/news?apikey=${process.env.NEWSDATA_API_KEY}&q=${encodedTerm}&language=en`;
 
-      const response = await fetch(url);
+      const response = await fetchWithTimeout(url, {
+        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; TrendMonitor/1.0)' }
+      });
+
       if (!response.ok) {
         throw new Error(`NewsData.io returned ${response.status}`);
       }
@@ -289,7 +371,7 @@ async function fetchNewsVolume(searchTerms, days = 7) {
           title: a.title,
           source: a.source_id,
           pubDate: a.pubDate,
-          link: a.link,
+          link: isValidUrl(a.link) ? a.link : null,
         })),
       });
 
@@ -315,7 +397,9 @@ async function fetchGoogleNews(searchTerms) {
   for (const term of searchTerms.slice(0, 3)) { // Conservative limit
     try {
       const url = `https://serpapi.com/search.json?engine=google_news&q=${encodeURIComponent(term)}&api_key=${process.env.SERPAPI_KEY}`;
-      const response = await fetch(url);
+      const response = await fetchWithTimeout(url, {
+        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; TrendMonitor/1.0)' }
+      });
 
       if (!response.ok) {
         throw new Error(`SerpAPI returned ${response.status}`);
@@ -341,52 +425,65 @@ async function fetchGoogleNews(searchTerms) {
 /**
  * Calculate trend score from multiple data sources
  * Returns a normalized score 0-100 and change percentage
+ *
+ * Scoring: Each source contributes up to 40 points, normalized to 0-100
  */
 function calculateTrendScore(googleTrends, newsData, serpResults, previousScore = 50) {
   let score = 0;
-  let dataPoints = 0;
+  let maxPossibleScore = 0;
   let articles = [];
 
-  // Factor 1: Google Trends RSS mentions
-  if (googleTrends && googleTrends.length > 0) {
-    // Check if any of our terms appear in trending topics
-    score += 20; // Base score if we can fetch trends
-    dataPoints++;
+  // Factor 1: Google Trends RSS - bonus if our terms are trending
+  if (googleTrends) {
+    maxPossibleScore += 40;
+    if (googleTrends.hasMatches) {
+      // High score if our terms appear in trending topics
+      score += 40;
+    } else if (googleTrends.allTrends.length > 0) {
+      // Small score just for being able to fetch data
+      score += 5;
+    }
   }
 
   // Factor 2: NewsData.io volume
   if (newsData && newsData.length > 0) {
+    maxPossibleScore += 40;
     const totalArticles = newsData.reduce((sum, r) => sum + r.totalResults, 0);
     // Normalize: 0-10 articles = low, 10-50 = medium, 50+ = high
     const newsScore = Math.min(40, (totalArticles / 50) * 40);
     score += newsScore;
-    dataPoints++;
 
     // Collect article summaries
     for (const result of newsData) {
       for (const article of result.articles || []) {
-        articles.push(`- ${article.title} (${article.source})`);
+        if (article.title) {
+          articles.push(`- ${article.title} (${article.source || 'Unknown'})`);
+        }
       }
     }
   }
 
   // Factor 3: SerpAPI Google News
   if (serpResults && serpResults.length > 0) {
+    maxPossibleScore += 40;
     const totalNews = serpResults.reduce((sum, r) => sum + r.totalResults, 0);
     const serpScore = Math.min(40, (totalNews / 30) * 40);
     score += serpScore;
-    dataPoints++;
 
     // Collect article summaries
     for (const result of serpResults) {
       for (const news of (result.newsResults || []).slice(0, 3)) {
-        articles.push(`- ${news.title} (${news.source?.name || 'Unknown'})`);
+        if (news.title) {
+          articles.push(`- ${news.title} (${news.source?.name || 'Unknown'})`);
+        }
       }
     }
   }
 
-  // Normalize score
-  const normalizedScore = dataPoints > 0 ? Math.round(score / dataPoints * (100 / 40)) : 50;
+  // Normalize score: scale to 0-100 based on max possible
+  const normalizedScore = maxPossibleScore > 0
+    ? Math.round((score / maxPossibleScore) * 100)
+    : 50;
   const finalScore = Math.min(100, Math.max(0, normalizedScore));
 
   // Calculate change percentage from previous
@@ -398,7 +495,7 @@ function calculateTrendScore(googleTrends, newsData, serpResults, previousScore 
     trendScore: finalScore,
     changePercent,
     articles: articles.slice(0, 10).join('\n') || 'No articles found',
-    dataSourcesUsed: dataPoints,
+    dataSourcesUsed: (googleTrends ? 1 : 0) + (newsData?.length > 0 ? 1 : 0) + (serpResults?.length > 0 ? 1 : 0),
   };
 }
 
@@ -415,13 +512,13 @@ async function analyzeMonitorTrends(monitor) {
 
   // Fetch data from multiple sources
   const [googleTrends, newsData, serpResults] = await Promise.all([
-    fetchGoogleTrendsRSS('US'),
+    fetchGoogleTrendsRSS(monitor.terms, 'US'),
     fetchNewsVolume(monitor.terms),
     fetchGoogleNews(monitor.terms),
   ]);
 
-  // Get previous score (you'd store this in Notion or use last_check logic)
-  const previousScore = 50; // Default baseline
+  // Get previous score (default baseline)
+  const previousScore = 50;
 
   // Calculate combined trend score
   const trendData = calculateTrendScore(googleTrends, newsData, serpResults, previousScore);
@@ -481,7 +578,13 @@ async function main() {
     process.exit(1);
   }
 
+  // Warn if SIGNALS_DB not configured
+  if (!SIGNALS_DB) {
+    console.log('Warning: SIGNALS_DATABASE_ID not set - alerts will be disabled');
+  }
+
   // Show available data sources
+  console.log('');
   console.log('Data Sources:');
   console.log(`  - Google Trends RSS: Available (free)`);
   console.log(`  - NewsData.io: ${process.env.NEWSDATA_API_KEY ? 'Configured' : 'Not configured'}`);
@@ -516,15 +619,21 @@ async function main() {
         const trendData = await analyzeMonitorTrends(monitor);
 
         // Update monitor in Notion
-        await updateMonitor(monitor.pageId, trendData);
-        analyzed++;
+        const updated = await updateMonitor(monitor.pageId, trendData);
+        if (updated) analyzed++;
 
         // Check threshold and create alert if exceeded
         if (Math.abs(trendData.changePercent) >= monitor.threshold) {
           console.log(`  ⚠️ THRESHOLD EXCEEDED: ${trendData.changePercent}% (threshold: ${monitor.threshold}%)`);
           if (SIGNALS_DB) {
-            await createAlert(monitor, trendData);
-            alerts++;
+            // Check for duplicate before creating
+            const alertExists = await alertExistsToday(monitor.monitorId);
+            if (!alertExists) {
+              const created = await createAlert(monitor, trendData);
+              if (created) alerts++;
+            } else {
+              console.log(`  Skipping duplicate alert for ${monitor.monitorId}`);
+            }
           }
         }
 

@@ -45,6 +45,15 @@ jobs:
             echo "::error::MONITORS_DATABASE_ID not configured"
             exit 1
           fi
+          if [ -z "${{ secrets.SIGNALS_DATABASE_ID }}" ]; then
+            echo "::warning::SIGNALS_DATABASE_ID not configured - alerts will be disabled"
+          fi
+          if [ -z "${{ secrets.NEWSDATA_API_KEY }}" ]; then
+            echo "::notice::NEWSDATA_API_KEY not configured (optional)"
+          fi
+          if [ -z "${{ secrets.SERPAPI_KEY }}" ]; then
+            echo "::notice::SERPAPI_KEY not configured (optional)"
+          fi
 
       - name: Install dependencies
         run: npm ci
