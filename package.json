@@ -5,7 +5,9 @@
   "main": "scanner.js",
   "scripts": {
     "scan": "node scanner.js",
-    "test": "node scanner.js --dry-run"
+    "test": "node scanner.js --dry-run",
+    "trends": "node trend-monitor.js",
+    "trends:test": "node trend-monitor.js --dry-run"
   },
   "dependencies": {
     "@notionhq/client": "^2.2.14",
