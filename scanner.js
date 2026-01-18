@@ -40,13 +40,25 @@ const RSS_FEEDS = [
   { name: 'MJBizDaily', url: 'https://mjbizdaily.com/feed/', category: 'cannabis' },
   { name: 'Marijuana Moment', url: 'https://www.marijuanamoment.net/feed/', category: 'legal' },
   { name: 'Hemp Industry Daily', url: 'https://hempindustrydaily.com/feed/', category: 'hemp' },
-  { name: 'Leafly News', url: 'https://www.leafly.com/news/feed', category: 'cannabis' },
+  { name: 'Leafly News', url: 'https://www.leafly.com/feed', category: 'cannabis' },
+  { name: 'High Times', url: 'https://hightimes.com/feed/', category: 'cannabis' },
+  { name: 'Cannabis Industry Journal', url: 'https://cannabisindustryjournal.com/feed/', category: 'cannabis' },
 
   // Trade & Tariffs
-  { name: 'Trade.gov News', url: 'https://www.trade.gov/rss/trade-news.xml', category: 'trade' },
+  { name: 'CBP Trade', url: 'https://www.cbp.gov/rss/trade', category: 'trade' },
+  { name: 'CBP Forced Labor', url: 'https://www.cbp.gov/rss/trade/forced-labor', category: 'trade' },
+  { name: 'JOC Trade', url: 'https://www.joc.com/api/rssfeed/8880', category: 'trade' },
 
-  // Vape/Tobacco Regulation
-  { name: 'FDA Tobacco', url: 'https://www.fda.gov/about-fda/contact-fda/stay-informed/rss-feeds/tobacco-products/rss.xml', category: 'regulation' },
+  // Regulation
+  { name: 'Tobacco Reporter', url: 'https://tobaccoreporter.com/feed/', category: 'regulation' },
+  { name: 'TTB Announcements', url: 'https://www.ttb.gov/templates/ttb/news/announcements.xml', category: 'regulation' },
+
+  // Supply Chain
+  { name: 'FreightWaves', url: 'https://www.freightwaves.com/feed', category: 'supply_chain' },
+  { name: 'JOC Supply Chain', url: 'https://www.joc.com/api/rssfeed/24517', category: 'supply_chain' },
+  { name: 'JOC Trans-Pacific', url: 'https://www.joc.com/api/rssfeed/24521', category: 'supply_chain' },
+  { name: 'JOC Container Shipping', url: 'https://www.joc.com/api/rssfeed/24515', category: 'supply_chain' },
+  { name: 'SCMP China', url: 'https://www.scmp.com/rss/4/feed', category: 'supply_chain' },
 ];
 
 // ============================================================================
@@ -61,6 +73,10 @@ const MONITOR_KEYWORDS = {
     'smoke cartel', 'dankstop', 'everything for 420',
     'mikes worldwide', 'mwi wholesale',
     'storz bickel', 'davinci', 'pax labs',
+    'pulsar', 'lookah', 'hamilton devices', 'ispire', 'airistech',
+    'gpen', 'g pen', 'grenco science', 'dr dabber', 'focus v',
+    'mj arsenal', 'higher standards', 'ooze', 'kind pen', 'eyce',
+    'grav labs', 'empire glassworks', 'vessel vape', 'genius pipe',
   ],
 
   // Regulations & Legal
@@ -71,6 +87,10 @@ const MONITOR_KEYWORDS = {
     'cannabis rescheduling', 'schedule iii', 'dea cannabis',
     'state cannabis law', 'legalization bill',
     'vape ban', 'flavored vape', 'disposable vape ban',
+    'premarket tobacco', 'substantial equivalence', 'marketing denial order',
+    'mdo', 'warning letter fda', 'import alert', 'synthetic nicotine',
+    'delta 8 ban', 'delta 8 thc', 'flavor ban', 'menthol ban',
+    'state vape law', 'mail ban vape', 'usps vape ban', 'tobacco 21',
   ],
 
   // Tariffs & Trade
@@ -80,6 +100,10 @@ const MONITOR_KEYWORDS = {
     'customs enforcement', 'cbp seizure',
     'uflpa', 'forced labor', 'xinjiang',
     'fentanyl tariff', 'reciprocal tariff',
+    'hts code', 'harmonized tariff', 'section 232',
+    'antidumping duty', 'countervailing duty', 'de minimis',
+    'section 321', 'entity list', 'china manufacturing',
+    'nearshoring', 'friendshoring', 'cbp hold', 'customs hold',
   ],
 
   // Supply Chain
@@ -89,6 +113,10 @@ const MONITOR_KEYWORDS = {
     'port congestion', 'shipping delay', 'container rate',
     'ocean freight', 'supply chain disruption',
     'vietnam manufacturing', 'india manufacturing',
+    'dongguan', 'ningbo', 'foshan', 'freight rate', 'air freight',
+    'red sea shipping', 'suez canal', 'panama canal', 'port strike',
+    'factory closure', 'golden week', 'quality control china',
+    'factory audit', 'supplier diversification',
   ],
 
   // Trade Shows
@@ -96,6 +124,8 @@ const MONITOR_KEYWORDS = {
     'mjbizcon', 'champs trade show', 'hall of flowers',
     'tpe total product expo', 'canton fair',
     'tobacco plus expo', 'cannabis conference',
+    'indo expo', 'spannabis', 'necann', 'emerald cup',
+    'cannabis cup', 'lift expo', 'vape expo', 'smoke shop expo',
   ],
 
   // Market & Business
@@ -113,11 +143,59 @@ const MONITOR_KEYWORDS = {
     'cpsc recall', 'product safety',
     'lab testing', 'heavy metals', 'pesticide',
   ],
+
+  // Banking & Payments
+  banking_payments: [
+    'cannabis banking', 'marijuana banking', 'cannabis credit card',
+    'cashless cannabis', 'payment processing cannabis', 'high risk merchant',
+    'debanking', 'bank account closure', 'safe banking', 'safer banking',
+  ],
+
+  // Technology
+  technology: [
+    'cannabis ecommerce', 'online smoke shop', 'online head shop',
+    'weedmaps', 'dutchie', 'jane technologies', 'cannabis pos',
+    'flowhub', 'treez',
+  ],
+
+  // Mergers & Acquisitions
+  mergers_acquisitions: [
+    'cannabis acquisition', 'cannabis merger', 'dispensary acquisition',
+    'cannabis consolidation', 'mso expansion', 'cannabis ipo',
+    'cannabis funding', 'greenlane merger', 'distributor acquisition',
+  ],
 };
 
 // ============================================================================
 // HELPER FUNCTIONS
 // ============================================================================
+
+/**
+ * Sleep helper
+ */
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * Wrapper for Notion API calls with exponential backoff for rate limiting
+ */
+async function notionRequest(fn, retries = 3) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      return await fn();
+    } catch (error) {
+      if (error.code === 'rate_limited' || error.status === 429) {
+        const delay = Math.pow(2, i) * 1000;
+        console.log(`  Rate limited, waiting ${delay}ms...`);
+        await sleep(delay);
+        continue;
+      }
+      throw error;
+    }
+  }
+  throw new Error('Max retries exceeded');
+}
 
 /**
  * Fetch and parse RSS feeds
@@ -150,7 +228,7 @@ async function fetchRSSFeeds() {
       // Small delay between feeds
       await sleep(500);
     } catch (error) {
-      console.log(`  ⚠ Error fetching ${feed.name}: ${error.message}`);
+      console.log(`  Warning: Error fetching ${feed.name}: ${error.message}`);
     }
   }
 
@@ -176,14 +254,23 @@ async function fetchGoogleNews() {
 
   for (const query of searches) {
     try {
+      // NOTE: SerpAPI requires API key in URL query parameter; header auth not supported.
+      // Consider using a server-side proxy in production to avoid exposing the key in logs.
       const url = `https://serpapi.com/search.json?engine=google_news&q=${encodeURIComponent(query)}&api_key=${process.env.SERPAPI_KEY}`;
       const response = await fetch(url);
       const data = await response.json();
 
       for (const item of data.news_results || []) {
+        const itemLink = item.link || '';
+
+        // Skip items with invalid URLs
+        if (itemLink && !isValidUrl(itemLink)) {
+          continue;
+        }
+
         articles.push({
           title: item.title,
-          link: item.link,
+          link: itemLink,
           content: item.snippet || '',
           source: item.source?.name || 'Google News',
           category: 'google',
@@ -193,7 +280,7 @@ async function fetchGoogleNews() {
 
       await sleep(1000); // Rate limit SerpAPI
     } catch (error) {
-      console.log(`  ⚠ SerpAPI error for "${query}": ${error.message}`);
+      console.error(`  SerpAPI error for "${query}": ${error.message}`);
     }
   }
 
@@ -244,40 +331,51 @@ function getSignalType(category) {
     trade_shows: 'NEWS',
     market: 'FUNDING',
     compliance: 'LEGAL',
+    banking_payments: 'LEGAL',
+    technology: 'NEWS',
+    mergers_acquisitions: 'FUNDING',
   };
   return mapping[category] || 'NEWS';
 }
 
 /**
- * Check if signal already exists in Notion
+ * Check if signal already exists in Notion (improved duplicate detection)
  */
 async function signalExists(link) {
-  if (!link) return false;
+  if (!link) return true; // Conservative: skip if no link
 
   try {
-    const response = await notion.databases.query({
+    // Check by source property (contains the URL)
+    const response = await notionRequest(() => notion.databases.query({
       database_id: SIGNALS_DB,
       filter: {
         property: 'source',
         rich_text: { contains: link.substring(0, 100) }
       },
       page_size: 1
-    });
+    }));
     return response.results.length > 0;
   } catch (error) {
-    return false;
+    // On error, return true (conservative - skip rather than create duplicate)
+    console.error(`  Warning: Error checking for duplicate, skipping: ${error.message}`);
+    return true;
   }
 }
 
 /**
- * Create signal in Notion
+ * Create signal in Notion (single API call with children blocks)
  */
 async function createSignal(article) {
   const signalId = `auto-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`;
 
+  // Safe date validation
+  const timestamp = article.pubDate instanceof Date && !isNaN(article.pubDate)
+    ? article.pubDate.toISOString().split('T')[0]
+    : new Date().toISOString().split('T')[0];
+
   try {
-    // Create the page
-    const page = await notion.pages.create({
+    // Create the page with children blocks in a single API call
+    await notionRequest(() => notion.pages.create({
       parent: { database_id: SIGNALS_DB },
       icon: { type: 'emoji', emoji: '📰' },
       properties: {
@@ -287,14 +385,9 @@ async function createSignal(article) {
         'content': { rich_text: [{ text: { content: article.title.substring(0, 2000) } }] },
         'source': { rich_text: [{ text: { content: article.link.substring(0, 2000) } }] },
         'confidence': { number: 0.7 },
-        'timestamp': { date: { start: article.pubDate.toISOString().split('T')[0] } },
+        'timestamp': { date: { start: timestamp } },
         'processed': { checkbox: false },
-      }
-    });
-
-    // Add content blocks to page body
-    await notion.blocks.children.append({
-      block_id: page.id,
+      },
       children: [
         {
           type: 'heading_2',
@@ -325,7 +418,7 @@ async function createSignal(article) {
         },
         {
           type: 'bulleted_list_item',
-          bulleted_list_item: { rich_text: [{ text: { content: `Published: ${article.pubDate.toISOString().split('T')[0]}` } }] }
+          bulleted_list_item: { rich_text: [{ text: { content: `Published: ${timestamp}` } }] }
         },
         {
           type: 'heading_3',
@@ -343,25 +436,18 @@ async function createSignal(article) {
           type: 'paragraph',
           paragraph: {
             rich_text: [{
-              text: { content: '🔗 Read full article', link: { url: article.link } }
+              text: { content: 'Read full article', link: { url: article.link } }
             }]
           }
         },
       ]
-    });
+    }));
 
     return true;
   } catch (error) {
-    console.log(`  ⚠ Error creating signal: ${error.message}`);
+    console.log(`  Warning: Error creating signal: ${error.message}`);
     return false;
   }
-}
-
-/**
- * Sleep helper
- */
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 // ============================================================================
@@ -381,19 +467,19 @@ async function main() {
 
   // Validate environment
   if (!process.env.NOTION_TOKEN) {
-    console.error('❌ Error: NOTION_TOKEN environment variable not set');
+    console.error('Error: NOTION_TOKEN environment variable not set');
     process.exit(1);
   }
   if (!SIGNALS_DB) {
-    console.error('❌ Error: SIGNALS_DATABASE_ID environment variable not set');
+    console.error('Error: SIGNALS_DATABASE_ID environment variable not set');
     process.exit(1);
   }
 
   try {
     // Test Notion connection
     console.log('Testing Notion connection...');
-    await notion.databases.retrieve({ database_id: SIGNALS_DB });
-    console.log('✓ Notion connection successful');
+    await notionRequest(() => notion.databases.retrieve({ database_id: SIGNALS_DB }));
+    console.log('Notion connection successful');
     console.log('');
 
     // Step 1: Fetch RSS feeds
@@ -435,7 +521,7 @@ async function main() {
       } else {
         const success = await createSignal(article);
         if (success) {
-          console.log(`  ✓ Created: ${article.title.substring(0, 60)}...`);
+          console.log(`  Created: ${article.title.substring(0, 60)}...`);
           created++;
         }
       }
@@ -461,7 +547,7 @@ async function main() {
 
   } catch (error) {
     console.error('');
-    console.error('❌ Fatal error:', error.message);
+    console.error('Fatal error:', error.message);
     console.error('');
     process.exit(1);
   }
