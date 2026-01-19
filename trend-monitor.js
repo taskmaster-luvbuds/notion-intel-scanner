@@ -37,6 +37,7 @@
 
 const { Client } = require('@notionhq/client');
 const Parser = require('rss-parser');
+const { calculateSentiment, calculateArticleSentiment } = require('./sentiment');
 
 // Initialize Notion client
 const notion = new Client({ auth: process.env.NOTION_TOKEN });
@@ -50,12 +51,15 @@ const DRY_RUN = process.env.DRY_RUN === 'true' || process.argv.includes('--dry-r
 const FETCH_TIMEOUT_MS = 10000;
 const MAX_CONTENT_LENGTH = 1900;
 
-// Source Reliability Weights (Phase 1)
+// Source Reliability Weights (Enhanced with all sources)
 const SOURCE_WEIGHTS = {
-  googleTrends: { reliability: 0.85, weight: 0.25 },
-  googleNewsRss: { reliability: 0.80, weight: 0.25 },  // Free Google News RSS
-  newsData: { reliability: 0.80, weight: 0.25 },
-  serpApi: { reliability: 0.90, weight: 0.25 },
+  googleTrends: { reliability: 0.85, weight: 0.14 },
+  googleNewsRss: { reliability: 0.80, weight: 0.14 },  // Free Google News RSS
+  newsData: { reliability: 0.80, weight: 0.14 },
+  serpApi: { reliability: 0.90, weight: 0.14 },
+  hackerNews: { reliability: 0.85, weight: 0.14 },     // HackerNews Algolia API (free)
+  reddit: { reliability: 0.70, weight: 0.10 },         // Reddit JSON API (free)
+  additionalRss: { reliability: 0.80, weight: 0.20 },  // BBC, Guardian
 };
 
 // Multi-region configuration for Google Trends
@@ -183,6 +187,294 @@ function parseTerms(termsText) {
     .split(',')
     .map(term => term.trim())
     .filter(term => term.length > 0);
+}
+
+// ============================================================================
+// ARTICLE DEDUPLICATION
+// ============================================================================
+
+/**
+ * Normalize URL for comparison (remove tracking params, etc.)
+ */
+function normalizeUrl(url) {
+  if (!url) return '';
+  try {
+    const parsed = new URL(url);
+    const trackingParams = ['utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content',
+                           'ref', 'source', 'fbclid', 'gclid', 'msclkid'];
+    trackingParams.forEach(param => parsed.searchParams.delete(param));
+    return parsed.toString().toLowerCase();
+  } catch {
+    return url.toLowerCase();
+  }
+}
+
+/**
+ * Calculate title similarity using Jaccard coefficient
+ */
+function calculateTitleSimilarity(title1, title2) {
+  if (!title1 || !title2) return 0;
+  const normalize = (t) => t.toLowerCase().replace(/[^a-z0-9\s]/g, '').split(/\s+/).filter(w => w.length > 2);
+  const words1 = new Set(normalize(title1));
+  const words2 = new Set(normalize(title2));
+  if (words1.size === 0 || words2.size === 0) return 0;
+  const intersection = new Set([...words1].filter(x => words2.has(x)));
+  const union = new Set([...words1, ...words2]);
+  return intersection.size / union.size;
+}
+
+/**
+ * Deduplicate articles from multiple sources
+ * Returns deduplicated array with duplicates merged
+ */
+function deduplicateArticles(articles, similarityThreshold = 0.6) {
+  if (!articles || articles.length === 0) {
+    return { articles: [], originalCount: 0, deduplicatedCount: 0 };
+  }
+
+  const originalCount = articles.length;
+  const seen = new Map();
+  const titleGroups = [];
+  const result = [];
+
+  for (const article of articles) {
+    const normalizedUrl = normalizeUrl(article.link || article.url);
+
+    // Check URL-based deduplication first
+    if (normalizedUrl && seen.has(normalizedUrl)) {
+      const existing = seen.get(normalizedUrl);
+      existing.sources = existing.sources || [existing.source];
+      if (article.source && !existing.sources.includes(article.source)) {
+        existing.sources.push(article.source);
+      }
+      continue;
+    }
+
+    // Check title similarity
+    let foundSimilar = false;
+    for (const group of titleGroups) {
+      const similarity = calculateTitleSimilarity(article.title, group[0].title);
+      if (similarity >= similarityThreshold) {
+        group.push(article);
+        const existing = group[0];
+        existing.sources = existing.sources || [existing.source];
+        if (article.source && !existing.sources.includes(article.source)) {
+          existing.sources.push(article.source);
+        }
+        foundSimilar = true;
+        break;
+      }
+    }
+
+    if (!foundSimilar) {
+      titleGroups.push([article]);
+      if (normalizedUrl) {
+        seen.set(normalizedUrl, article);
+      }
+      article.sources = article.sources || [article.source];
+      result.push(article);
+    }
+  }
+
+  return {
+    articles: result,
+    originalCount,
+    deduplicatedCount: result.length,
+  };
+}
+
+// ============================================================================
+// TREND DIRECTION INDICATOR
+// ============================================================================
+
+/**
+ * Calculate trend direction based on change percentage
+ * Returns: direction, emoji, strength, and description
+ */
+function calculateTrendDirection(currentScore, previousScore, changePercent) {
+  let direction, emoji, strength, description;
+
+  if (changePercent > 20) {
+    direction = 'up'; emoji = '🚀'; strength = 'strong'; description = 'Strong upward trend';
+  } else if (changePercent > 10) {
+    direction = 'up'; emoji = '📈'; strength = 'moderate'; description = 'Moderate upward trend';
+  } else if (changePercent > 3) {
+    direction = 'up'; emoji = '↗️'; strength = 'weak'; description = 'Weak upward trend';
+  } else if (changePercent < -20) {
+    direction = 'down'; emoji = '📉'; strength = 'strong'; description = 'Strong downward trend';
+  } else if (changePercent < -10) {
+    direction = 'down'; emoji = '⬇️'; strength = 'moderate'; description = 'Moderate downward trend';
+  } else if (changePercent < -3) {
+    direction = 'down'; emoji = '↘️'; strength = 'weak'; description = 'Weak downward trend';
+  } else {
+    direction = 'stable'; emoji = '➡️'; strength = 'stable'; description = 'Stable trend';
+  }
+
+  return { direction, emoji, strength, description, currentScore, previousScore, changePercent };
+}
+
+/**
+ * Calculate momentum trend based on regional consistency and article timing
+ */
+function calculateMomentumTrend(regionData, articleTimestamps) {
+  let regionScore = 0;
+  let recencyScore = 50;
+
+  if (regionData) {
+    const regions = Object.values(regionData);
+    const totalRegions = regions.length;
+    const regionsWithMatches = regions.filter(r => r.matches > 0).length;
+    regionScore = totalRegions > 0 ? (regionsWithMatches / totalRegions) * 100 : 0;
+  }
+
+  if (articleTimestamps && articleTimestamps.length > 0) {
+    const now = new Date();
+    const last24Hours = articleTimestamps.filter(ts => {
+      const articleDate = new Date(ts);
+      const hoursDiff = (now - articleDate) / (1000 * 60 * 60);
+      return hoursDiff <= 24;
+    }).length;
+
+    const last48Hours = articleTimestamps.filter(ts => {
+      const articleDate = new Date(ts);
+      const hoursDiff = (now - articleDate) / (1000 * 60 * 60);
+      return hoursDiff > 24 && hoursDiff <= 48;
+    }).length;
+
+    if (last24Hours > last48Hours * 1.5) {
+      recencyScore = 100; // Accelerating
+    } else if (last24Hours > last48Hours * 0.75) {
+      recencyScore = 50; // Steady
+    } else {
+      recencyScore = 0; // Decelerating
+    }
+  }
+
+  const combinedScore = (regionScore * 0.4) + (recencyScore * 0.6);
+
+  if (combinedScore >= 70) return 'accelerating';
+  else if (combinedScore >= 30) return 'steady';
+  else return 'decelerating';
+}
+
+// ============================================================================
+// ACTION RECOMMENDATIONS ENGINE
+// ============================================================================
+
+/**
+ * Generate action recommendations based on trend, coherence, and confidence data
+ * @param {object} trendData - Trend score data including trendScore, factors, changePercent
+ * @param {object} coherenceData - Coherence score data including coherenceScore, coherenceLevel
+ * @param {object} confidenceData - Confidence data including confidence percentage
+ * @param {object} monitor - Monitor object with terms and other details
+ * @returns {array} Array of recommendation objects with priority and text
+ */
+function generateActionRecommendations(trendData, coherenceData, confidenceData, monitor) {
+  const recommendations = [];
+  const term = monitor.terms[0] || 'this topic';
+  const trendScore = trendData.trendScore || 0;
+  const coherence = coherenceData.coherenceScore || 0;
+  const confidence = confidenceData.confidence || 0;
+  const sentiment = trendData.factors?.sentiment || 50;
+
+  // High Priority Actions (trendScore > 70 AND coherence > 60)
+  if (trendScore > 70 && coherence > 60) {
+    recommendations.push({
+      priority: 'high',
+      text: `Create content about ${term} - high trending activity detected`
+    });
+    recommendations.push({
+      priority: 'high',
+      text: 'Consider market entry - strong positive signal across sources'
+    });
+    recommendations.push({
+      priority: 'high',
+      text: 'Monitor competitor activity - trend gaining momentum'
+    });
+  }
+  // Medium Priority Actions (trendScore 40-70 OR coherence 40-60)
+  else if ((trendScore >= 40 && trendScore <= 70) || (coherence >= 40 && coherence <= 60)) {
+    recommendations.push({
+      priority: 'medium',
+      text: 'Track this trend - moderate activity detected'
+    });
+    recommendations.push({
+      priority: 'medium',
+      text: 'Research deeper - mixed signals need clarification'
+    });
+    recommendations.push({
+      priority: 'medium',
+      text: 'Set up alerts - potential emerging opportunity'
+    });
+  }
+  // Low Priority Actions (trendScore < 40)
+  else if (trendScore < 40) {
+    recommendations.push({
+      priority: 'low',
+      text: 'Continue monitoring - no significant activity'
+    });
+    recommendations.push({
+      priority: 'low',
+      text: 'Review search terms - may need refinement'
+    });
+    recommendations.push({
+      priority: 'low',
+      text: 'Check back next cycle - insufficient data'
+    });
+  }
+
+  // Confidence-based modifiers
+  if (confidence < 30) {
+    recommendations.push({
+      priority: 'low',
+      text: 'Low confidence - gather more data before acting',
+      isModifier: true
+    });
+  } else if (confidence > 70) {
+    recommendations.push({
+      priority: 'high',
+      text: 'High confidence signal - action recommended',
+      isModifier: true
+    });
+  }
+
+  // Sentiment-based additions
+  if (sentiment < 40) {
+    recommendations.push({
+      priority: 'medium',
+      text: 'Caution: Negative sentiment detected',
+      isModifier: true
+    });
+  } else if (sentiment > 60) {
+    recommendations.push({
+      priority: 'medium',
+      text: 'Positive sentiment - favorable environment',
+      isModifier: true
+    });
+  }
+
+  return recommendations;
+}
+
+/**
+ * Prioritize and format recommendations
+ * @param {array} recommendations - Array of recommendation objects
+ * @returns {array} Sorted and limited array with priority emojis
+ */
+function prioritizeRecommendations(recommendations) {
+  const priorityOrder = { high: 0, medium: 1, low: 2 };
+  const priorityEmoji = { high: '🔴', medium: '🟡', low: '🟢' };
+
+  // Sort by priority
+  const sorted = recommendations.sort((a, b) => {
+    return priorityOrder[a.priority] - priorityOrder[b.priority];
+  });
+
+  // Add emoji and limit to top 3
+  return sorted.slice(0, 3).map(rec => ({
+    ...rec,
+    formattedText: `${priorityEmoji[rec.priority]} ${rec.text}`
+  }));
 }
 
 // ============================================================================
@@ -364,6 +656,20 @@ async function updateMonitorContent(pageId, monitor, results) {
           { text: { content: `${results.changePercent}%` } }
         ] }
       },
+      {
+        type: 'bulleted_list_item',
+        bulleted_list_item: { rich_text: [
+          { text: { content: 'Trend Direction: ' }, annotations: { bold: true } },
+          { text: { content: `${results.trendDirection?.emoji || '➡️'} ${results.trendDirection?.description || 'Stable trend'} (${results.trendDirection?.strength || 'stable'})` } }
+        ] }
+      },
+      {
+        type: 'bulleted_list_item',
+        bulleted_list_item: { rich_text: [
+          { text: { content: 'Momentum: ' }, annotations: { bold: true } },
+          { text: { content: results.momentumTrend ? results.momentumTrend.charAt(0).toUpperCase() + results.momentumTrend.slice(1) : 'Steady' } }
+        ] }
+      },
       // Data Sources Checked section
       {
         type: 'heading_3',
@@ -420,6 +726,23 @@ async function updateMonitorContent(pageId, monitor, results) {
         type: 'paragraph',
         paragraph: { rich_text: [{ text: { content: 'No related articles found.' } }] }
       });
+    }
+
+    // Add Recommended Actions section
+    if (results.prioritizedRecommendations && results.prioritizedRecommendations.length > 0) {
+      blocks.push({
+        type: 'heading_3',
+        heading_3: { rich_text: [{ text: { content: 'Recommended Actions' } }] }
+      });
+
+      for (const rec of results.prioritizedRecommendations) {
+        const confidenceQualifier = results.confidence < 30 ? ' (low confidence)' :
+          results.confidence > 70 ? ' (high confidence)' : '';
+        blocks.push({
+          type: 'bulleted_list_item',
+          bulleted_list_item: { rich_text: [{ text: { content: `${rec.formattedText}${confidenceQualifier}` } }] }
+        });
+      }
     }
 
     // Add Summary section
@@ -501,6 +824,7 @@ async function updateMonitor(pageId, results) {
     console.log(`    - source_urls: ${results.sourceUrls ? results.sourceUrls.split('\n').length + ' URLs' : '(none)'}`);
     console.log(`    - regions_data: ${results.regionsData || '(none)'}`);
     console.log(`    - summary: ${results.contextSummary || '(none)'}`);
+    console.log(`    - recommendations: ${results.recommendations ? results.recommendations.substring(0, 100) + '...' : '(none)'}`);
     return true;
   }
 
@@ -545,6 +869,11 @@ async function updateMonitor(pageId, results) {
     if (results.contextSummary) {
       properties['summary'] = {
         rich_text: [{ text: { content: results.contextSummary.substring(0, MAX_CONTENT_LENGTH) } }]
+      };
+    }
+    if (results.recommendations) {
+      properties['recommendations'] = {
+        rich_text: [{ text: { content: results.recommendations.substring(0, 2000) } }]
       };
     }
 
@@ -666,6 +995,14 @@ async function createAlert(monitor, trendData) {
           bulleted_list_item: { rich_text: [{ text: { content: `Change: ${trendData.changePercent}%` } }] }
         },
         {
+          type: 'bulleted_list_item',
+          bulleted_list_item: { rich_text: [{ text: { content: `Trend Direction: ${trendData.trendDirection?.emoji || '➡️'} ${trendData.trendDirection?.description || 'Stable'} (${trendData.trendDirection?.strength || 'stable'})` } }] }
+        },
+        {
+          type: 'bulleted_list_item',
+          bulleted_list_item: { rich_text: [{ text: { content: `Momentum: ${trendData.momentumTrend ? trendData.momentumTrend.charAt(0).toUpperCase() + trendData.momentumTrend.slice(1) : 'Steady'}` } }] }
+        },
+        {
           type: 'heading_3',
           heading_3: { rich_text: [{ text: { content: 'Score Factors' } }] }
         },
@@ -694,6 +1031,17 @@ async function createAlert(monitor, trendData) {
         {
           type: 'bulleted_list_item',
           bulleted_list_item: { rich_text: [{ text: { content: `Data Sources: ${trendData.dataSourcesUsed}` } }] }
+        },
+        {
+          type: 'heading_3',
+          heading_3: { rich_text: [{ text: { content: 'Recommended Action' } }] }
+        },
+        {
+          type: 'callout',
+          callout: {
+            icon: { type: 'emoji', emoji: '💡' },
+            rich_text: [{ text: { content: trendData.topRecommendation || 'No recommendations available' } }]
+          }
         },
         {
           type: 'heading_3',
@@ -937,6 +1285,188 @@ async function fetchGoogleNews(searchTerms) {
 }
 
 /**
+ * Fetch Reddit posts via JSON API (FREE - no auth required)
+ * Uses Reddit's public JSON API: https://www.reddit.com/search.json
+ * Returns posts with scores, comments, and recency weighting
+ */
+async function fetchRedditPosts(searchTerms) {
+  const results = [];
+
+  for (const term of searchTerms.slice(0, 5)) { // Limit to 5 terms
+    try {
+      const encodedTerm = encodeURIComponent(term);
+      const url = `https://www.reddit.com/search.json?q=${encodedTerm}&sort=relevance&t=week&limit=10`;
+
+      const response = await fetchWithTimeout(url, {
+        headers: {
+          'User-Agent': 'TrendMonitor/1.0 (trend monitoring bot)',
+          'Accept': 'application/json'
+        }
+      });
+
+      if (!response.ok) {
+        throw new Error(`Reddit API returned ${response.status}`);
+      }
+
+      const data = await response.json();
+      const posts = (data.data?.children || []).map(child => {
+        const post = child.data;
+        return {
+          title: post.title,
+          url: `https://www.reddit.com${post.permalink}`,
+          score: post.score || 0,
+          num_comments: post.num_comments || 0,
+          created_utc: post.created_utc,
+          subreddit: post.subreddit,
+          recencyWeight: calculateRecencyWeight(new Date(post.created_utc * 1000)),
+        };
+      });
+
+      // Calculate weighted count (recent posts with high engagement count more)
+      const weightedCount = posts.reduce((sum, p) => {
+        const engagementMultiplier = Math.min(2, 1 + (p.score + p.num_comments) / 500);
+        return sum + p.recencyWeight * engagementMultiplier;
+      }, 0);
+
+      results.push({
+        term,
+        totalResults: posts.length,
+        weightedCount,
+        posts,
+      });
+
+      await sleep(500); // Rate limit between terms (Reddit is stricter)
+    } catch (error) {
+      console.error(`  Reddit API error for "${term}": ${error.message}`);
+      results.push({
+        term,
+        totalResults: 0,
+        weightedCount: 0,
+        posts: [],
+        error: error.message,
+      });
+    }
+  }
+
+  return results;
+}
+
+/**
+ * Fetch HackerNews stories via Algolia API (FREE, unlimited, no auth)
+ * Endpoint: https://hn.algolia.com/api/v1/search?query={term}&tags=story
+ * Returns recent stories with points, comments, and recency weighting
+ */
+async function fetchHackerNews(searchTerms) {
+  const results = [];
+
+  for (const term of searchTerms.slice(0, 5)) { // Limit to 5 terms
+    try {
+      const encodedTerm = encodeURIComponent(term);
+      const url = `https://hn.algolia.com/api/v1/search?query=${encodedTerm}&tags=story`;
+
+      const response = await fetchWithTimeout(url, {
+        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; TrendMonitor/1.0)' }
+      });
+
+      if (!response.ok) {
+        throw new Error(`HackerNews API returned ${response.status}`);
+      }
+
+      const data = await response.json();
+      const stories = (data.hits || []).slice(0, 10).map(hit => ({
+        title: hit.title,
+        url: hit.url || `https://news.ycombinator.com/item?id=${hit.objectID}`,
+        points: hit.points || 0,
+        num_comments: hit.num_comments || 0,
+        created_at: hit.created_at,
+        recencyWeight: calculateRecencyWeight(hit.created_at),
+      }));
+
+      // Calculate weighted count (recent stories with high engagement count more)
+      const weightedCount = stories.reduce((sum, s) => {
+        const engagementMultiplier = Math.min(2, 1 + (s.points + s.num_comments) / 200);
+        return sum + s.recencyWeight * engagementMultiplier;
+      }, 0);
+
+      results.push({
+        term,
+        totalResults: stories.length,
+        weightedCount,
+        stories,
+      });
+
+      await sleep(300); // Rate limit between terms
+    } catch (error) {
+      console.error(`  HackerNews API error for "${term}": ${error.message}`);
+      results.push({
+        term,
+        totalResults: 0,
+        weightedCount: 0,
+        stories: [],
+        error: error.message,
+      });
+    }
+  }
+
+  return results;
+}
+
+/**
+ * Fetch from additional RSS feeds (BBC, Guardian)
+ * All FREE - no API keys required
+ */
+async function fetchAdditionalNewsRSS(searchTerms) {
+  const parser = new Parser({
+    timeout: FETCH_TIMEOUT_MS,
+    headers: { 'User-Agent': 'Mozilla/5.0 (compatible; TrendMonitor/1.0)' }
+  });
+
+  const feeds = [
+    { name: 'BBC News', url: 'https://feeds.bbci.co.uk/news/rss.xml' },
+    { name: 'The Guardian', url: 'https://www.theguardian.com/world/rss' },
+  ];
+
+  const allArticles = [];
+
+  for (const feedConfig of feeds) {
+    try {
+      const feed = await parser.parseURL(feedConfig.url);
+
+      const articles = (feed.items || []).map(item => ({
+        title: item.title,
+        link: item.link,
+        pubDate: item.pubDate,
+        source: feedConfig.name,
+        description: item.contentSnippet || '',
+        recencyWeight: calculateRecencyWeight(item.pubDate),
+      }));
+
+      // Filter articles that match any search term
+      const matchingArticles = articles.filter(article =>
+        searchTerms.some(term => {
+          const termLower = term.toLowerCase();
+          return (article.title?.toLowerCase().includes(termLower) ||
+                  article.description?.toLowerCase().includes(termLower));
+        })
+      );
+
+      allArticles.push(...matchingArticles);
+      await sleep(200);
+    } catch (error) {
+      console.error(`  RSS feed error for ${feedConfig.name}: ${error.message}`);
+    }
+  }
+
+  const weightedCount = allArticles.reduce((sum, a) => sum + a.recencyWeight, 0);
+
+  return {
+    allMatchingArticles: allArticles,
+    totalMatches: allArticles.length,
+    weightedCount,
+  };
+}
+
+/**
  * Calculate Coherence Score - measures signal agreement across sources
  * Range: 0-100 (higher = more reliable signal)
  *
@@ -946,7 +1476,7 @@ async function fetchGoogleNews(searchTerms) {
  * - Temporal Consistency (25%): Sustained trend or spike?
  * - Term Correlation (20%): Related terms trending together?
  */
-function calculateCoherenceScore(googleTrends, googleNewsRss, newsData, serpResults) {
+function calculateCoherenceScore(googleTrends, googleNewsRss, newsData, serpResults, reddit, hackerNews, additionalRss) {
   let directionAgreement = 0;
   let magnitudeConsistency = 0;
   let temporalConsistency = 0;
@@ -993,6 +1523,38 @@ function calculateCoherenceScore(googleTrends, googleNewsRss, newsData, serpResu
       hasSignal: totalNews > 0,
       magnitude: totalNews,
       termCoverage: serpResults.filter(r => r.totalResults > 0).length / serpResults.length,
+    });
+  }
+
+  // Reddit (free source)
+  if (reddit && reddit.length > 0) {
+    const totalPosts = reddit.reduce((sum, r) => sum + r.totalResults, 0);
+    sourceSignals.push({
+      source: 'reddit',
+      hasSignal: totalPosts > 0,
+      magnitude: totalPosts,
+      termCoverage: reddit.filter(r => r.totalResults > 0).length / reddit.length,
+    });
+  }
+
+  // HackerNews (free source)
+  if (hackerNews && hackerNews.length > 0) {
+    const totalStories = hackerNews.reduce((sum, r) => sum + r.totalResults, 0);
+    sourceSignals.push({
+      source: 'hackerNews',
+      hasSignal: totalStories > 0,
+      magnitude: totalStories,
+      termCoverage: hackerNews.filter(r => r.totalResults > 0).length / hackerNews.length,
+    });
+  }
+
+  // Additional RSS (BBC, Guardian - free sources)
+  if (additionalRss && additionalRss.totalMatches > 0) {
+    sourceSignals.push({
+      source: 'additionalRss',
+      hasSignal: additionalRss.totalMatches > 0,
+      magnitude: additionalRss.totalMatches,
+      termCoverage: 1, // Already filtered for matching terms
     });
   }
 
@@ -1078,10 +1640,10 @@ function calculateCoherenceScore(googleTrends, googleNewsRss, newsData, serpResu
  * - Sample size
  * - Source agreement
  */
-function calculateConfidenceV2(googleTrends, googleNewsRss, newsData, serpResults, coherenceScore) {
+function calculateConfidenceV2(googleTrends, googleNewsRss, newsData, serpResults, reddit, hackerNews, additionalRss, coherenceScore) {
   let baseConfidence = 0;
   let dataPoints = 0;
-  const maxDataPoints = 4; // Now have 4 possible sources
+  const maxDataPoints = 7; // 7 possible sources (including Reddit, HackerNews, and Additional RSS)
 
   // Calculate weighted source contributions
   if (googleTrends && googleTrends.allTrends?.length > 0) {
@@ -1114,7 +1676,31 @@ function calculateConfidenceV2(googleTrends, googleNewsRss, newsData, serpResult
     }
   }
 
-  // Apply multipliers (adjusted for 4 possible sources)
+  // Reddit (FREE - public JSON API)
+  if (reddit && reddit.length > 0) {
+    const hasPosts = reddit.some(r => r.totalResults > 0);
+    if (hasPosts) {
+      baseConfidence += SOURCE_WEIGHTS.reddit.reliability * SOURCE_WEIGHTS.reddit.weight;
+      dataPoints++;
+    }
+  }
+
+  // HackerNews (FREE - Algolia API)
+  if (hackerNews && hackerNews.length > 0) {
+    const hasStories = hackerNews.some(r => r.totalResults > 0);
+    if (hasStories) {
+      baseConfidence += SOURCE_WEIGHTS.hackerNews.reliability * SOURCE_WEIGHTS.hackerNews.weight;
+      dataPoints++;
+    }
+  }
+
+  // Additional RSS (BBC, Guardian - FREE)
+  if (additionalRss && additionalRss.totalMatches > 0) {
+    baseConfidence += SOURCE_WEIGHTS.additionalRss.reliability * SOURCE_WEIGHTS.additionalRss.weight;
+    dataPoints++;
+  }
+
+  // Apply multipliers (adjusted for 7 possible sources)
   const freshnessMultiplier = 0.4 + (0.6 * (dataPoints / maxDataPoints)); // 0.4 - 1.0
   const sampleSizeMultiplier = 0.3 + (0.7 * Math.min(1, dataPoints / maxDataPoints)); // 0.3 - 1.0
   const agreementMultiplier = 0.75 + (0.40 * (coherenceScore / 100)); // 0.75 - 1.15
@@ -1148,7 +1734,7 @@ function calculateConfidenceV2(googleTrends, googleNewsRss, newsData, serpResult
  * - Authority (15%): Source credibility weighted
  * - Recency (15%): Article freshness weighted
  */
-function calculateTrendScoreV2(googleTrends, googleNewsRss, newsData, serpResults, monitorId) {
+function calculateTrendScoreV2(googleTrends, googleNewsRss, newsData, serpResults, reddit, hackerNews, additionalRss, monitorId) {
   let articles = [];
 
   // Get previous score from history (or use baseline)
@@ -1223,6 +1809,57 @@ function calculateTrendScoreV2(googleTrends, googleNewsRss, newsData, serpResult
     }
   }
 
+  // Reddit (free source)
+  if (reddit && reddit.length > 0) {
+    const totalPosts = reddit.reduce((sum, r) => sum + r.totalResults, 0);
+    const redditScore = Math.min(100, (totalPosts / 20) * 100);
+    authorityScore += SOURCE_WEIGHTS.reddit.reliability *
+      SOURCE_WEIGHTS.reddit.weight * redditScore;
+    totalWeight += SOURCE_WEIGHTS.reddit.weight;
+
+    // Collect Reddit post summaries
+    for (const result of reddit) {
+      for (const post of (result.posts || []).slice(0, 3)) {
+        if (post.title) {
+          articles.push(`- ${post.title} (Reddit r/${post.subreddit}: ${post.score} pts)`);
+        }
+      }
+    }
+  }
+
+  // HackerNews (free source)
+  if (hackerNews && hackerNews.length > 0) {
+    const totalStories = hackerNews.reduce((sum, r) => sum + r.totalResults, 0);
+    const hnScore = Math.min(100, (totalStories / 20) * 100);
+    authorityScore += SOURCE_WEIGHTS.hackerNews.reliability *
+      SOURCE_WEIGHTS.hackerNews.weight * hnScore;
+    totalWeight += SOURCE_WEIGHTS.hackerNews.weight;
+
+    // Collect HackerNews story summaries
+    for (const result of hackerNews) {
+      for (const story of (result.stories || []).slice(0, 3)) {
+        if (story.title) {
+          articles.push(`- ${story.title} (HackerNews: ${story.points} pts)`);
+        }
+      }
+    }
+  }
+
+  // Additional RSS (BBC, Guardian - free sources)
+  if (additionalRss && additionalRss.totalMatches > 0) {
+    const rssScore = Math.min(100, (additionalRss.totalMatches / 10) * 100);
+    authorityScore += SOURCE_WEIGHTS.additionalRss.reliability *
+      SOURCE_WEIGHTS.additionalRss.weight * rssScore;
+    totalWeight += SOURCE_WEIGHTS.additionalRss.weight;
+
+    // Collect Additional RSS article summaries
+    for (const article of (additionalRss.allMatchingArticles || []).slice(0, 3)) {
+      if (article.title) {
+        articles.push(`- ${article.title} (${article.source})`);
+      }
+    }
+  }
+
   authorityScore = totalWeight > 0 ? authorityScore / totalWeight : 0;
 
   // === Factor 3: Recency (15%) - Article freshness weighted ===
@@ -1271,9 +1908,77 @@ function calculateTrendScoreV2(googleTrends, googleNewsRss, newsData, serpResult
   // === Factor 5: Velocity (20%) - Rate of change ===
   // Will be calculated after we have the raw score
 
-  // === Factor 6: Sentiment (10%) - Basic sentiment (placeholder) ===
-  // For now, use neutral baseline. Can be enhanced with VADER later.
-  const sentimentScore = 50;
+  // === Factor 6: Sentiment (10%) - AFINN-based sentiment analysis ===
+  // Collect article objects for sentiment analysis
+  const articleObjectsForSentiment = [];
+
+  // Collect from Google News RSS
+  if (googleNewsRss && googleNewsRss.length > 0) {
+    for (const result of googleNewsRss) {
+      for (const article of (result.articles || [])) {
+        if (article.title) {
+          articleObjectsForSentiment.push({ title: article.title });
+        }
+      }
+    }
+  }
+
+  // Collect from NewsData
+  if (newsData && newsData.length > 0) {
+    for (const result of newsData) {
+      for (const article of (result.articles || [])) {
+        if (article.title) {
+          articleObjectsForSentiment.push({ title: article.title });
+        }
+      }
+    }
+  }
+
+  // Collect from SerpAPI
+  if (serpResults && serpResults.length > 0) {
+    for (const result of serpResults) {
+      for (const news of (result.newsResults || [])) {
+        if (news.title) {
+          articleObjectsForSentiment.push({ title: news.title });
+        }
+      }
+    }
+  }
+
+  // Collect from Reddit
+  if (reddit && reddit.length > 0) {
+    for (const result of reddit) {
+      for (const post of (result.posts || [])) {
+        if (post.title) {
+          articleObjectsForSentiment.push({ title: post.title });
+        }
+      }
+    }
+  }
+
+  // Collect from HackerNews
+  if (hackerNews && hackerNews.length > 0) {
+    for (const result of hackerNews) {
+      for (const story of (result.stories || [])) {
+        if (story.title) {
+          articleObjectsForSentiment.push({ title: story.title });
+        }
+      }
+    }
+  }
+
+  // Collect from Additional RSS (BBC, Guardian)
+  if (additionalRss && additionalRss.allMatchingArticles) {
+    for (const article of additionalRss.allMatchingArticles) {
+      if (article.title) {
+        articleObjectsForSentiment.push({ title: article.title });
+      }
+    }
+  }
+
+  // Calculate sentiment using AFINN analysis
+  const sentimentData = calculateArticleSentiment(articleObjectsForSentiment);
+  const sentimentScore = sentimentData.score;
 
   // Calculate raw trend score (without velocity)
   const rawScore = Math.round(
@@ -1316,7 +2021,10 @@ function calculateTrendScoreV2(googleTrends, googleNewsRss, newsData, serpResult
     (googleTrends && googleTrends.allTrends?.length > 0 ? 1 : 0) +
     (googleNewsRss?.length > 0 && googleNewsRss.some(r => r.totalResults > 0) ? 1 : 0) +
     (newsData?.length > 0 && newsData.some(r => r.totalResults > 0) ? 1 : 0) +
-    (serpResults?.length > 0 && serpResults.some(r => r.totalResults > 0) ? 1 : 0);
+    (serpResults?.length > 0 && serpResults.some(r => r.totalResults > 0) ? 1 : 0) +
+    (reddit?.length > 0 && reddit.some(r => r.totalResults > 0) ? 1 : 0) +
+    (hackerNews?.length > 0 && hackerNews.some(r => r.totalResults > 0) ? 1 : 0) +
+    (additionalRss && additionalRss.totalMatches > 0 ? 1 : 0);
 
   return {
     trendScore: clampedFinalScore,
@@ -1348,11 +2056,14 @@ async function analyzeMonitorTrends(monitor) {
   console.log(`  Terms: ${monitor.terms.join(', ')}`);
 
   // Fetch data from multiple sources (multi-region for Google Trends)
-  const [googleTrends, googleNewsRss, newsData, serpResults] = await Promise.all([
+  const [googleTrends, googleNewsRss, newsData, serpResults, reddit, hackerNews, additionalRss] = await Promise.all([
     fetchGoogleTrendsRSS(monitor.terms), // Now fetches US, GB, CA, AU
     fetchGoogleNewsRSS(monitor.terms),   // FREE - no API key required
     fetchNewsVolume(monitor.terms),
     fetchGoogleNews(monitor.terms),
+    fetchRedditPosts(monitor.terms),     // FREE - Reddit public JSON API
+    fetchHackerNews(monitor.terms),      // FREE - HackerNews Algolia API
+    fetchAdditionalNewsRSS(monitor.terms), // FREE - BBC, Guardian RSS
   ]);
 
   // Log region data
@@ -1371,15 +2082,54 @@ async function analyzeMonitorTrends(monitor) {
     console.log(`  Google News RSS: ${googleNewsRssArticleCount} articles found`);
   }
 
+  // Log Reddit results
+  if (reddit && reddit.length > 0) {
+    const totalRedditPosts = reddit.reduce((sum, r) => sum + r.totalResults, 0);
+    console.log(`  Reddit: ${totalRedditPosts} posts found`);
+  }
+
+  // Log HackerNews results
+  if (hackerNews && hackerNews.length > 0) {
+    const totalHNStories = hackerNews.reduce((sum, r) => sum + r.totalResults, 0);
+    console.log(`  HackerNews: ${totalHNStories} stories found`);
+  }
+
+  // Log Additional RSS results (BBC, Guardian)
+  if (additionalRss && additionalRss.totalMatches > 0) {
+    console.log(`  Additional RSS (BBC, Guardian): ${additionalRss.totalMatches} articles found`);
+  }
+
   // Calculate Coherence Score first (needed for confidence)
-  const coherenceData = calculateCoherenceScore(googleTrends, googleNewsRss, newsData, serpResults);
+  const coherenceData = calculateCoherenceScore(googleTrends, googleNewsRss, newsData, serpResults, reddit, hackerNews, additionalRss);
   console.log(`  Coherence: ${coherenceData.coherenceScore} (${coherenceData.coherenceLevel})`);
 
   // Calculate Trend Score v2 (with all 6 factors)
-  const trendData = calculateTrendScoreV2(googleTrends, googleNewsRss, newsData, serpResults, monitor.monitorId);
+  const trendData = calculateTrendScoreV2(googleTrends, googleNewsRss, newsData, serpResults, reddit, hackerNews, additionalRss, monitor.monitorId);
 
   // Calculate Confidence v2 (uses coherence)
-  const confidenceData = calculateConfidenceV2(googleTrends, googleNewsRss, newsData, serpResults, coherenceData.coherenceScore);
+  const confidenceData = calculateConfidenceV2(googleTrends, googleNewsRss, newsData, serpResults, reddit, hackerNews, additionalRss, coherenceData.coherenceScore);
+
+  // Calculate Trend Direction
+  const previousScore = monitor.previousTrendScore || 50;
+  const trendDirection = calculateTrendDirection(trendData.trendScore, previousScore, trendData.changePercent);
+
+  // Collect article timestamps for momentum calculation
+  const articleTimestamps = [];
+  if (googleNewsRss) {
+    for (const result of googleNewsRss) {
+      for (const article of (result.articles || [])) {
+        if (article.pubDate) articleTimestamps.push(article.pubDate);
+      }
+    }
+  }
+  if (additionalRss && additionalRss.allMatchingArticles) {
+    for (const article of additionalRss.allMatchingArticles) {
+      if (article.pubDate) articleTimestamps.push(article.pubDate);
+    }
+  }
+
+  // Calculate Momentum Trend
+  const momentumTrend = calculateMomentumTrend(googleTrends.regionData, articleTimestamps);
 
   console.log(`  Trend Score: ${trendData.trendScore} (raw: ${trendData.rawScore}, smoothed: ${trendData.smoothedScore})`);
   console.log(`  Change: ${trendData.changePercent}%`);
@@ -1434,8 +2184,27 @@ async function analyzeMonitorTrends(monitor) {
     }
   }
 
-  // Format top 3 articles as markdown links
-  const topArticlesFormatted = topArticles
+  // Collect from Additional RSS (BBC, Guardian)
+  if (additionalRss && additionalRss.allMatchingArticles) {
+    for (const article of additionalRss.allMatchingArticles) {
+      if (article.title && article.link) {
+        topArticles.push({ title: article.title, url: article.link, source: article.source || 'Additional RSS' });
+        sourceUrls.add(article.link);
+      }
+    }
+  }
+
+  // Apply deduplication to articles
+  const deduplicationResult = deduplicateArticles(topArticles);
+  const deduplicatedArticles = deduplicationResult.articles;
+
+  // Log deduplication stats if any duplicates were removed
+  if (deduplicationResult.originalCount > deduplicationResult.deduplicatedCount) {
+    console.log(`  Deduplication: ${deduplicationResult.originalCount} -> ${deduplicationResult.deduplicatedCount} articles`);
+  }
+
+  // Format top 3 articles as markdown links (using deduplicated articles)
+  const topArticlesFormatted = deduplicatedArticles
     .slice(0, 3)
     .map(a => `[${a.title}](${a.url})`)
     .join('\n');
@@ -1469,10 +2238,32 @@ async function analyzeMonitorTrends(monitor) {
   if (serpArticleCount > 0) {
     summaryParts.push(`${serpArticleCount} article${serpArticleCount > 1 ? 's' : ''} from Google News (SerpAPI)`);
   }
+  if (additionalRss && additionalRss.totalMatches > 0) {
+    summaryParts.push(`${additionalRss.totalMatches} article${additionalRss.totalMatches > 1 ? 's' : ''} from BBC/Guardian`);
+  }
   if (summaryParts.length === 0) {
     summaryParts.push('No matching trends or articles found');
   }
   const contextSummary = summaryParts.join('. ') + '.';
+
+  // Generate action recommendations
+  const rawRecommendations = generateActionRecommendations(
+    trendData,
+    { coherenceScore: coherenceData.coherenceScore, coherenceLevel: coherenceData.coherenceLevel },
+    confidenceData,
+    monitor
+  );
+  const prioritizedRecommendations = prioritizeRecommendations(rawRecommendations);
+
+  // Format recommendations for storage
+  const recommendationsText = prioritizedRecommendations
+    .map(rec => rec.formattedText)
+    .join('\n');
+
+  // Get top recommendation for summary
+  const topRecommendation = prioritizedRecommendations.length > 0
+    ? prioritizedRecommendations[0].formattedText
+    : 'No recommendations';
 
   return {
     ...trendData,
@@ -1481,13 +2272,27 @@ async function analyzeMonitorTrends(monitor) {
     coherenceFactors: coherenceData.factors,
     confidence: confidenceData.confidence,
     confidenceFactors: confidenceData.factors,
-    summary: `${monitor.terms[0] || 'Unknown'}: Score ${trendData.trendScore}, Coherence ${coherenceData.coherenceScore} (${coherenceData.coherenceLevel}), Change ${trendData.changePercent}%`,
+    summary: `${monitor.terms[0] || 'Unknown'}: Score ${trendData.trendScore} ${trendDirection.emoji}, Coherence ${coherenceData.coherenceScore} (${coherenceData.coherenceLevel}), Change ${trendData.changePercent}%. ${trendDirection.description}. Top action: ${topRecommendation}`,
     // New context properties
     topArticles: topArticlesFormatted,
     sourceUrls: Array.from(sourceUrls).slice(0, 10).join('\n'),
     regionsData,
     contextSummary,
     googleNewsRssArticleCount,
+    // Action recommendations
+    recommendations: recommendationsText,
+    prioritizedRecommendations: prioritizedRecommendations,
+    topRecommendation: topRecommendation,
+    // Trend direction and momentum
+    trendDirection: trendDirection,
+    momentumTrend: momentumTrend,
+    // Deduplication stats
+    deduplication: {
+      originalCount: deduplicationResult.originalCount,
+      deduplicatedCount: deduplicationResult.deduplicatedCount,
+    },
+    // Additional RSS article count
+    additionalRssArticleCount: additionalRss ? additionalRss.totalMatches : 0,
   };
 }
 
