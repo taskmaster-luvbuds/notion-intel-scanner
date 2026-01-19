@@ -19,6 +19,7 @@
  *
  * Data Sources (Free Tier):
  * - Google Trends RSS (daily trending searches - free, no API key)
+ * - Google News RSS (search-based news - free, no API key)
  * - NewsData.io (200 credits/day free)
  * - Google News via SerpAPI (100 searches/month free, if configured)
  *
@@ -51,9 +52,10 @@ const MAX_CONTENT_LENGTH = 1900;
 
 // Source Reliability Weights (Phase 1)
 const SOURCE_WEIGHTS = {
-  googleTrends: { reliability: 0.85, weight: 0.35 },
-  newsData: { reliability: 0.80, weight: 0.35 },
-  serpApi: { reliability: 0.90, weight: 0.30 },
+  googleTrends: { reliability: 0.85, weight: 0.25 },
+  googleNewsRss: { reliability: 0.80, weight: 0.25 },  // Free Google News RSS
+  newsData: { reliability: 0.80, weight: 0.25 },
+  serpApi: { reliability: 0.90, weight: 0.25 },
 };
 
 // Multi-region configuration for Google Trends
@@ -243,6 +245,246 @@ async function fetchActiveMonitors() {
   }
 
   return monitors;
+}
+
+/**
+ * Clear all existing blocks from a Notion page
+ */
+async function clearPageContent(pageId) {
+  try {
+    // Fetch all existing blocks
+    const response = await notionRequest(() => notion.blocks.children.list({
+      block_id: pageId,
+      page_size: 100,
+    }));
+
+    // Delete each block
+    for (const block of response.results) {
+      await notionRequest(() => notion.blocks.delete({
+        block_id: block.id,
+      }));
+      await sleep(100); // Rate limit
+    }
+
+    return true;
+  } catch (error) {
+    console.error(`  Warning: Error clearing page content: ${error.message}`);
+    return false;
+  }
+}
+
+/**
+ * Update monitor page CONTENT with rich blocks (similar to INTEL Signals)
+ * Creates a Trend Analysis Report with detailed metrics and articles
+ */
+async function updateMonitorContent(pageId, monitor, results) {
+  if (DRY_RUN) {
+    console.log(`  [DRY RUN] Would update page content for ${pageId}`);
+    return true;
+  }
+
+  try {
+    // Clear existing content first
+    await clearPageContent(pageId);
+
+    const now = new Date().toISOString().split('T')[0];
+
+    // Determine coherence emoji
+    const coherenceEmoji = results.coherenceLevel === 'High' ? '🎯' :
+      results.coherenceLevel === 'Medium' ? '📊' : '⚡';
+
+    // Build the blocks array
+    const blocks = [
+      // Main heading
+      {
+        type: 'heading_2',
+        heading_2: { rich_text: [{ text: { content: '📊 Trend Analysis Report' } }] }
+      },
+      // Last updated
+      {
+        type: 'paragraph',
+        paragraph: { rich_text: [{ text: { content: `Last Updated: ${now}` } }] }
+      },
+      // Monitor Details section
+      {
+        type: 'heading_3',
+        heading_3: { rich_text: [{ text: { content: 'Monitor Details' } }] }
+      },
+      {
+        type: 'bulleted_list_item',
+        bulleted_list_item: { rich_text: [
+          { text: { content: 'Terms: ' }, annotations: { bold: true } },
+          { text: { content: monitor.terms.join(', ') } }
+        ] }
+      },
+      {
+        type: 'bulleted_list_item',
+        bulleted_list_item: { rich_text: [
+          { text: { content: 'Interval: ' }, annotations: { bold: true } },
+          { text: { content: monitor.interval } }
+        ] }
+      },
+      {
+        type: 'bulleted_list_item',
+        bulleted_list_item: { rich_text: [
+          { text: { content: 'Threshold: ' }, annotations: { bold: true } },
+          { text: { content: `${monitor.threshold}%` } }
+        ] }
+      },
+      // Scoring Metrics section
+      {
+        type: 'heading_3',
+        heading_3: { rich_text: [{ text: { content: 'Scoring Metrics' } }] }
+      },
+      {
+        type: 'bulleted_list_item',
+        bulleted_list_item: { rich_text: [
+          { text: { content: 'Trend Score: ' }, annotations: { bold: true } },
+          { text: { content: `${results.trendScore}/100` } }
+        ] }
+      },
+      {
+        type: 'bulleted_list_item',
+        bulleted_list_item: { rich_text: [
+          { text: { content: `${coherenceEmoji} Coherence: ` }, annotations: { bold: true } },
+          { text: { content: `${results.coherenceScore}/100 (${results.coherenceLevel})` } }
+        ] }
+      },
+      {
+        type: 'bulleted_list_item',
+        bulleted_list_item: { rich_text: [
+          { text: { content: 'Confidence: ' }, annotations: { bold: true } },
+          { text: { content: `${Math.round(results.confidence * 100)}%` } }
+        ] }
+      },
+      {
+        type: 'bulleted_list_item',
+        bulleted_list_item: { rich_text: [
+          { text: { content: 'Change: ' }, annotations: { bold: true } },
+          { text: { content: `${results.changePercent}%` } }
+        ] }
+      },
+      // Data Sources Checked section
+      {
+        type: 'heading_3',
+        heading_3: { rich_text: [{ text: { content: 'Data Sources Checked' } }] }
+      },
+      {
+        type: 'bulleted_list_item',
+        bulleted_list_item: { rich_text: [{ text: { content: `Google Trends RSS (${GOOGLE_TRENDS_REGIONS.join(', ')}): ${results.regionsData || 'N/A'}` } }] }
+      },
+      {
+        type: 'bulleted_list_item',
+        bulleted_list_item: { rich_text: [{ text: { content: `Google News RSS: ${results.googleNewsRssArticleCount || 0} articles found` } }] }
+      },
+      {
+        type: 'bulleted_list_item',
+        bulleted_list_item: { rich_text: [{ text: { content: `Data sources used: ${results.dataSourcesUsed}` } }] }
+      },
+    ];
+
+    // Add Top Related Articles section
+    blocks.push({
+      type: 'heading_3',
+      heading_3: { rich_text: [{ text: { content: 'Top Related Articles' } }] }
+    });
+
+    // Parse top articles and add them as numbered list items with links
+    if (results.topArticles && results.topArticles.trim()) {
+      const articleLines = results.topArticles.split('\n').filter(line => line.trim());
+
+      for (let i = 0; i < articleLines.length; i++) {
+        const line = articleLines[i];
+        // Parse markdown link format: [Title](URL)
+        const match = line.match(/\[([^\]]+)\]\(([^)]+)\)/);
+
+        if (match) {
+          const title = match[1];
+          const url = match[2];
+          blocks.push({
+            type: 'numbered_list_item',
+            numbered_list_item: { rich_text: [
+              { text: { content: title, link: { url: url } } }
+            ] }
+          });
+        } else {
+          // Fallback: just add as text
+          blocks.push({
+            type: 'numbered_list_item',
+            numbered_list_item: { rich_text: [{ text: { content: line } }] }
+          });
+        }
+      }
+    } else {
+      blocks.push({
+        type: 'paragraph',
+        paragraph: { rich_text: [{ text: { content: 'No related articles found.' } }] }
+      });
+    }
+
+    // Add Summary section
+    blocks.push({
+      type: 'heading_3',
+      heading_3: { rich_text: [{ text: { content: 'Summary' } }] }
+    });
+
+    // Build summary explanation
+    let summaryText = results.contextSummary || 'No summary available.';
+
+    // Add score interpretation
+    if (results.trendScore >= 70) {
+      summaryText += '\n\nThis indicates a strong trending signal with high activity across monitored sources.';
+    } else if (results.trendScore >= 40) {
+      summaryText += '\n\nThis indicates moderate trending activity. Worth monitoring for changes.';
+    } else {
+      summaryText += '\n\nThis indicates low trending activity. The topic is not currently trending significantly.';
+    }
+
+    // Add coherence interpretation
+    if (results.coherenceLevel === 'High') {
+      summaryText += ' The high coherence score indicates strong agreement across data sources, making this a reliable signal.';
+    } else if (results.coherenceLevel === 'Medium') {
+      summaryText += ' The medium coherence score suggests moderate agreement across sources.';
+    } else {
+      summaryText += ' The low coherence score suggests inconsistent signals across sources - interpret with caution.';
+    }
+
+    blocks.push({
+      type: 'paragraph',
+      paragraph: { rich_text: [{ text: { content: summaryText } }] }
+    });
+
+    // Add divider
+    blocks.push({
+      type: 'divider',
+      divider: {}
+    });
+
+    // Add factor breakdown if available
+    if (results.factors) {
+      blocks.push({
+        type: 'heading_3',
+        heading_3: { rich_text: [{ text: { content: 'Score Factor Breakdown' } }] }
+      });
+      blocks.push({
+        type: 'paragraph',
+        paragraph: { rich_text: [{ text: {
+          content: `Velocity: ${results.factors.velocity} | Momentum: ${results.factors.momentum} | Sentiment: ${results.factors.sentiment} | Relevance: ${results.factors.relevance} | Authority: ${results.factors.authority} | Recency: ${results.factors.recency}`
+        } }] }
+      });
+    }
+
+    // Append blocks to the page
+    await notionRequest(() => notion.blocks.children.append({
+      block_id: pageId,
+      children: blocks,
+    }));
+
+    return true;
+  } catch (error) {
+    console.error(`  Warning: Error updating page content: ${error.message}`);
+    return false;
+  }
 }
 
 /**
@@ -535,6 +777,67 @@ async function fetchGoogleTrendsRSS(searchTerms, regions = GOOGLE_TRENDS_REGIONS
 }
 
 /**
+ * Fetch Google News RSS (FREE - no API key required)
+ * Uses Google News search RSS feed to get recent articles for search terms
+ * Endpoint: https://news.google.com/rss/search?q={searchTerms}&hl=en-US&gl=US&ceid=US:en
+ */
+async function fetchGoogleNewsRSS(searchTerms) {
+  const parser = new Parser({
+    timeout: FETCH_TIMEOUT_MS,
+    headers: { 'User-Agent': 'Mozilla/5.0 (compatible; TrendMonitor/1.0)' }
+  });
+
+  const results = [];
+
+  for (const term of searchTerms.slice(0, 5)) { // Limit to 5 terms
+    try {
+      const encodedTerm = encodeURIComponent(term);
+      const url = `https://news.google.com/rss/search?q=${encodedTerm}&hl=en-US&gl=US&ceid=US:en`;
+
+      const feed = await parser.parseURL(url);
+
+      const articles = (feed.items || []).slice(0, 10).map(item => {
+        // Extract source from title (Google News format: "Article Title - Source Name")
+        const titleParts = (item.title || '').split(' - ');
+        const source = titleParts.length > 1 ? titleParts[titleParts.length - 1] : 'Unknown';
+        const title = titleParts.length > 1 ? titleParts.slice(0, -1).join(' - ') : item.title;
+
+        return {
+          title: title,
+          link: item.link,
+          pubDate: item.pubDate,
+          source: source,
+          recencyWeight: calculateRecencyWeight(item.pubDate),
+        };
+      });
+
+      // Calculate weighted article count (recent articles count more)
+      const weightedCount = articles.reduce((sum, a) => sum + a.recencyWeight, 0);
+
+      results.push({
+        term,
+        totalResults: articles.length,
+        weightedCount,
+        articles,
+      });
+
+      await sleep(300); // Rate limit between terms
+    } catch (error) {
+      console.error(`  Google News RSS error for "${term}": ${error.message}`);
+      results.push({
+        term,
+        totalResults: 0,
+        weightedCount: 0,
+        articles: [],
+        error: error.message,
+      });
+    }
+  }
+
+  return results;
+}
+
+/**
  * Fetch news volume from NewsData.io (FREE tier: 200 credits/day)
  * Now includes recency weighting for articles
  */
@@ -643,7 +946,7 @@ async function fetchGoogleNews(searchTerms) {
  * - Temporal Consistency (25%): Sustained trend or spike?
  * - Term Correlation (20%): Related terms trending together?
  */
-function calculateCoherenceScore(googleTrends, newsData, serpResults) {
+function calculateCoherenceScore(googleTrends, googleNewsRss, newsData, serpResults) {
   let directionAgreement = 0;
   let magnitudeConsistency = 0;
   let temporalConsistency = 0;
@@ -659,6 +962,17 @@ function calculateCoherenceScore(googleTrends, newsData, serpResults) {
       magnitude: googleTrends.matchingTrends?.length || 0,
       regionAgreement: Object.values(googleTrends.regionData || {})
         .filter(r => r.matches > 0).length,
+    });
+  }
+
+  // Google News RSS (free source)
+  if (googleNewsRss && googleNewsRss.length > 0) {
+    const totalArticles = googleNewsRss.reduce((sum, r) => sum + r.totalResults, 0);
+    sourceSignals.push({
+      source: 'googleNewsRss',
+      hasSignal: totalArticles > 0,
+      magnitude: totalArticles,
+      termCoverage: googleNewsRss.filter(r => r.totalResults > 0).length / googleNewsRss.length,
     });
   }
 
@@ -764,14 +1078,24 @@ function calculateCoherenceScore(googleTrends, newsData, serpResults) {
  * - Sample size
  * - Source agreement
  */
-function calculateConfidenceV2(googleTrends, newsData, serpResults, coherenceScore) {
+function calculateConfidenceV2(googleTrends, googleNewsRss, newsData, serpResults, coherenceScore) {
   let baseConfidence = 0;
   let dataPoints = 0;
+  const maxDataPoints = 4; // Now have 4 possible sources
 
   // Calculate weighted source contributions
   if (googleTrends && googleTrends.allTrends?.length > 0) {
     baseConfidence += SOURCE_WEIGHTS.googleTrends.reliability * SOURCE_WEIGHTS.googleTrends.weight;
     dataPoints++;
+  }
+
+  // Google News RSS (free source)
+  if (googleNewsRss && googleNewsRss.length > 0) {
+    const hasData = googleNewsRss.some(r => r.totalResults > 0);
+    if (hasData) {
+      baseConfidence += SOURCE_WEIGHTS.googleNewsRss.reliability * SOURCE_WEIGHTS.googleNewsRss.weight;
+      dataPoints++;
+    }
   }
 
   if (newsData && newsData.length > 0) {
@@ -790,9 +1114,9 @@ function calculateConfidenceV2(googleTrends, newsData, serpResults, coherenceSco
     }
   }
 
-  // Apply multipliers
-  const freshnessMultiplier = 0.4 + (0.6 * (dataPoints / 3)); // 0.4 - 1.0
-  const sampleSizeMultiplier = 0.3 + (0.7 * Math.min(1, dataPoints / 3)); // 0.3 - 1.0
+  // Apply multipliers (adjusted for 4 possible sources)
+  const freshnessMultiplier = 0.4 + (0.6 * (dataPoints / maxDataPoints)); // 0.4 - 1.0
+  const sampleSizeMultiplier = 0.3 + (0.7 * Math.min(1, dataPoints / maxDataPoints)); // 0.3 - 1.0
   const agreementMultiplier = 0.75 + (0.40 * (coherenceScore / 100)); // 0.75 - 1.15
 
   let confidence = baseConfidence * freshnessMultiplier * sampleSizeMultiplier * agreementMultiplier;
@@ -823,7 +1147,7 @@ function calculateConfidenceV2(googleTrends, newsData, serpResults, coherenceSco
  * - Authority (15%): Source credibility weighted
  * - Recency (15%): Article freshness weighted
  */
-function calculateTrendScoreV2(googleTrends, newsData, serpResults, monitorId) {
+function calculateTrendScoreV2(googleTrends, googleNewsRss, newsData, serpResults, monitorId) {
   let articles = [];
 
   // Get previous score from history (or use baseline)
@@ -844,6 +1168,24 @@ function calculateTrendScoreV2(googleTrends, newsData, serpResults, monitorId) {
     authorityScore += SOURCE_WEIGHTS.googleTrends.reliability *
       SOURCE_WEIGHTS.googleTrends.weight * (googleTrends.hasMatches ? 100 : 20);
     totalWeight += SOURCE_WEIGHTS.googleTrends.weight;
+  }
+
+  // Google News RSS (free source)
+  if (googleNewsRss && googleNewsRss.length > 0) {
+    const totalArticles = googleNewsRss.reduce((sum, r) => sum + r.totalResults, 0);
+    const gnScore = Math.min(100, (totalArticles / 30) * 100);
+    authorityScore += SOURCE_WEIGHTS.googleNewsRss.reliability *
+      SOURCE_WEIGHTS.googleNewsRss.weight * gnScore;
+    totalWeight += SOURCE_WEIGHTS.googleNewsRss.weight;
+
+    // Collect article summaries from Google News RSS
+    for (const result of googleNewsRss) {
+      for (const article of (result.articles || []).slice(0, 3)) {
+        if (article.title) {
+          articles.push(`- ${article.title} (${article.source || 'Google News'})`);
+        }
+      }
+    }
   }
 
   if (newsData && newsData.length > 0) {
@@ -884,12 +1226,25 @@ function calculateTrendScoreV2(googleTrends, newsData, serpResults, monitorId) {
 
   // === Factor 3: Recency (15%) - Article freshness weighted ===
   let recencyScore = 50; // Default baseline
+  let recencySourceCount = 0;
+
+  // Include Google News RSS in recency calculation
+  if (googleNewsRss && googleNewsRss.length > 0) {
+    const totalWeighted = googleNewsRss.reduce((sum, r) => sum + (r.weightedCount || 0), 0);
+    const totalRaw = googleNewsRss.reduce((sum, r) => sum + r.totalResults, 0);
+    if (totalRaw > 0) {
+      recencyScore = Math.min(100, (totalWeighted / totalRaw) * 100);
+      recencySourceCount++;
+    }
+  }
 
   if (newsData && newsData.length > 0) {
     const totalWeighted = newsData.reduce((sum, r) => sum + (r.weightedCount || 0), 0);
     const totalRaw = newsData.reduce((sum, r) => sum + r.totalResults, 0);
     if (totalRaw > 0) {
-      recencyScore = Math.min(100, (totalWeighted / totalRaw) * 100);
+      const newsRecency = Math.min(100, (totalWeighted / totalRaw) * 100);
+      recencyScore = recencySourceCount > 0 ? (recencyScore + newsRecency) / 2 : newsRecency;
+      recencySourceCount++;
     }
   }
 
@@ -898,7 +1253,7 @@ function calculateTrendScoreV2(googleTrends, newsData, serpResults, monitorId) {
     const totalRaw = serpResults.reduce((sum, r) => sum + r.totalResults, 0);
     if (totalRaw > 0) {
       const serpRecency = Math.min(100, (totalWeighted / totalRaw) * 100);
-      recencyScore = (recencyScore + serpRecency) / 2;
+      recencyScore = recencySourceCount > 0 ? (recencyScore + serpRecency) / 2 : serpRecency;
     }
   }
 
@@ -958,6 +1313,7 @@ function calculateTrendScoreV2(googleTrends, newsData, serpResults, monitorId) {
   // Count data sources
   const dataSourcesUsed =
     (googleTrends && googleTrends.allTrends?.length > 0 ? 1 : 0) +
+    (googleNewsRss?.length > 0 && googleNewsRss.some(r => r.totalResults > 0) ? 1 : 0) +
     (newsData?.length > 0 && newsData.some(r => r.totalResults > 0) ? 1 : 0) +
     (serpResults?.length > 0 && serpResults.some(r => r.totalResults > 0) ? 1 : 0);
 
@@ -991,8 +1347,9 @@ async function analyzeMonitorTrends(monitor) {
   console.log(`  Terms: ${monitor.terms.join(', ')}`);
 
   // Fetch data from multiple sources (multi-region for Google Trends)
-  const [googleTrends, newsData, serpResults] = await Promise.all([
+  const [googleTrends, googleNewsRss, newsData, serpResults] = await Promise.all([
     fetchGoogleTrendsRSS(monitor.terms), // Now fetches US, GB, CA, AU
+    fetchGoogleNewsRSS(monitor.terms),   // FREE - no API key required
     fetchNewsVolume(monitor.terms),
     fetchGoogleNews(monitor.terms),
   ]);
@@ -1005,15 +1362,23 @@ async function analyzeMonitorTrends(monitor) {
     console.log(`  Regions checked: ${regions}`);
   }
 
+  // Log Google News RSS results
+  const googleNewsRssArticleCount = googleNewsRss
+    ? googleNewsRss.reduce((sum, r) => sum + r.totalResults, 0)
+    : 0;
+  if (googleNewsRssArticleCount > 0) {
+    console.log(`  Google News RSS: ${googleNewsRssArticleCount} articles found`);
+  }
+
   // Calculate Coherence Score first (needed for confidence)
-  const coherenceData = calculateCoherenceScore(googleTrends, newsData, serpResults);
+  const coherenceData = calculateCoherenceScore(googleTrends, googleNewsRss, newsData, serpResults);
   console.log(`  Coherence: ${coherenceData.coherenceScore} (${coherenceData.coherenceLevel})`);
 
   // Calculate Trend Score v2 (with all 6 factors)
-  const trendData = calculateTrendScoreV2(googleTrends, newsData, serpResults, monitor.monitorId);
+  const trendData = calculateTrendScoreV2(googleTrends, googleNewsRss, newsData, serpResults, monitor.monitorId);
 
   // Calculate Confidence v2 (uses coherence)
-  const confidenceData = calculateConfidenceV2(googleTrends, newsData, serpResults, coherenceData.coherenceScore);
+  const confidenceData = calculateConfidenceV2(googleTrends, googleNewsRss, newsData, serpResults, coherenceData.coherenceScore);
 
   console.log(`  Trend Score: ${trendData.trendScore} (raw: ${trendData.rawScore}, smoothed: ${trendData.smoothedScore})`);
   console.log(`  Change: ${trendData.changePercent}%`);
@@ -1028,9 +1393,21 @@ async function analyzeMonitorTrends(monitor) {
 
   // === Collect article context for storage ===
 
-  // Collect top articles with URLs (prefer NewsData, fallback to SerpAPI)
+  // Collect top articles with URLs (prefer Google News RSS since it's free, then NewsData, then SerpAPI)
   const topArticles = [];
   const sourceUrls = new Set();
+
+  // Collect from Google News RSS (FREE - prioritize this)
+  if (googleNewsRss && googleNewsRss.length > 0) {
+    for (const result of googleNewsRss) {
+      for (const article of (result.articles || [])) {
+        if (article.title && article.link) {
+          topArticles.push({ title: article.title, url: article.link, source: 'Google News RSS' });
+          sourceUrls.add(article.link);
+        }
+      }
+    }
+  }
 
   // Collect from NewsData
   if (newsData && newsData.length > 0) {
@@ -1082,11 +1459,14 @@ async function analyzeMonitorTrends(monitor) {
   if (trendMatchCount > 0) {
     summaryParts.push(`Found ${trendMatchCount} matching trend${trendMatchCount > 1 ? 's' : ''} in Google Trends`);
   }
+  if (googleNewsRssArticleCount > 0) {
+    summaryParts.push(`${googleNewsRssArticleCount} article${googleNewsRssArticleCount > 1 ? 's' : ''} from Google News RSS`);
+  }
   if (newsDataArticleCount > 0) {
     summaryParts.push(`${newsDataArticleCount} related article${newsDataArticleCount > 1 ? 's' : ''} from NewsData`);
   }
   if (serpArticleCount > 0) {
-    summaryParts.push(`${serpArticleCount} article${serpArticleCount > 1 ? 's' : ''} from Google News`);
+    summaryParts.push(`${serpArticleCount} article${serpArticleCount > 1 ? 's' : ''} from Google News (SerpAPI)`);
   }
   if (summaryParts.length === 0) {
     summaryParts.push('No matching trends or articles found');
@@ -1106,6 +1486,7 @@ async function analyzeMonitorTrends(monitor) {
     sourceUrls: Array.from(sourceUrls).slice(0, 10).join('\n'),
     regionsData,
     contextSummary,
+    googleNewsRssArticleCount,
   };
 }
 
@@ -1163,6 +1544,7 @@ async function main() {
   console.log('');
   console.log('Data Sources:');
   console.log(`  - Google Trends RSS: Available (regions: ${GOOGLE_TRENDS_REGIONS.join(', ')})`);
+  console.log(`  - Google News RSS: Available (FREE - no API key required)`);
   console.log(`  - NewsData.io: ${process.env.NEWSDATA_API_KEY ? 'Configured' : 'Not configured'}`);
   console.log(`  - SerpAPI: ${process.env.SERPAPI_KEY ? 'Configured' : 'Not configured'}`);
   console.log('');
@@ -1199,9 +1581,12 @@ async function main() {
       try {
         const trendData = await analyzeMonitorTrends(monitor);
 
-        // Update monitor in Notion
+        // Update monitor properties in Notion
         const updated = await updateMonitor(monitor.pageId, trendData);
         if (updated) analyzed++;
+
+        // Update monitor page content with rich blocks
+        await updateMonitorContent(monitor.pageId, monitor, trendData);
 
         // Check threshold and create alert if exceeded
         if (Math.abs(trendData.changePercent) >= monitor.threshold) {

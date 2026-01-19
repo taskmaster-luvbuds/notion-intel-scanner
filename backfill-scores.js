@@ -8,8 +8,20 @@
  * This script:
  * 1. Reads ALL active monitors from Notion (regardless of last_check or interval)
  * 2. Runs trend analysis on each using the scoring functions
- * 3. Writes scores (trend_score, Coherency, confidence, change_percent) to Notion
- * 4. Does NOT update last_check (so regular scheduling isn't affected)
+ * 3. Fetches data from multiple sources:
+ *    - Google Trends RSS (multi-region: US, GB, CA, AU)
+ *    - Google News RSS (direct, no API key required)
+ *    - NewsData.io API (if configured)
+ *    - SerpAPI Google News (if configured)
+ * 4. Writes scores (trend_score, Coherency, confidence, change_percent) to Notion
+ * 5. Updates page content with rich blocks:
+ *    - Trend Analysis Report header
+ *    - Monitor Details section
+ *    - Scoring Metrics section
+ *    - Data Sources Checked section
+ *    - Top Related Articles section
+ *    - Summary section
+ * 6. Updates last_check to today
  *
  * Usage:
  *   node backfill-scores.js           # Run backfill
@@ -56,6 +68,9 @@ const EMA_ALPHA = 0.3;
 
 // Recency decay constants
 const RECENCY_HALF_LIFE_DAYS = 3;
+
+// Max content length for Notion rich text
+const MAX_CONTENT_LENGTH = 1900;
 
 // ============================================================================
 // HELPER FUNCTIONS (copied from trend-monitor.js)
@@ -288,6 +303,210 @@ async function updateMonitorScoresOnly(pageId, monitorId, results) {
   }
 }
 
+/**
+ * Update page content with rich blocks (Trend Analysis Report)
+ * Creates structured content including:
+ * - Trend Analysis Report header
+ * - Monitor Details section
+ * - Scoring Metrics section
+ * - Data Sources Checked section
+ * - Top Related Articles section
+ * - Summary section
+ */
+async function updatePageContent(pageId, monitorId, monitor, results) {
+  if (DRY_RUN) {
+    console.log(`  [DRY RUN] Would update page content for ${monitorId}`);
+    return true;
+  }
+
+  try {
+    // First, delete existing content blocks (to avoid duplicates on re-runs)
+    const existingBlocks = await notionRequest(() => notion.blocks.children.list({
+      block_id: pageId,
+      page_size: 100,
+    }));
+
+    // Delete existing blocks
+    for (const block of existingBlocks.results) {
+      try {
+        await notionRequest(() => notion.blocks.delete({ block_id: block.id }));
+      } catch (err) {
+        // Ignore errors deleting blocks
+      }
+    }
+
+    // Determine coherence emoji
+    const coherenceEmoji = results.coherenceLevel === 'High' ? '🎯' :
+      results.coherenceLevel === 'Medium' ? '📊' : '⚡';
+
+    // Build the children blocks
+    const children = [
+      // Header
+      {
+        type: 'heading_1',
+        heading_1: { rich_text: [{ text: { content: '📈 Trend Analysis Report' } }] }
+      },
+      {
+        type: 'callout',
+        callout: {
+          icon: { type: 'emoji', emoji: '📅' },
+          rich_text: [{ text: { content: `Generated: ${new Date().toISOString().split('T')[0]}` } }]
+        }
+      },
+      // Monitor Details section
+      {
+        type: 'heading_2',
+        heading_2: { rich_text: [{ text: { content: 'Monitor Details' } }] }
+      },
+      {
+        type: 'bulleted_list_item',
+        bulleted_list_item: { rich_text: [{ text: { content: `Monitor ID: ${monitorId}` } }] }
+      },
+      {
+        type: 'bulleted_list_item',
+        bulleted_list_item: { rich_text: [{ text: { content: `Terms: ${monitor.terms.join(', ')}` } }] }
+      },
+      {
+        type: 'bulleted_list_item',
+        bulleted_list_item: { rich_text: [{ text: { content: `Interval: ${monitor.interval}` } }] }
+      },
+      {
+        type: 'bulleted_list_item',
+        bulleted_list_item: { rich_text: [{ text: { content: `Threshold: ${monitor.threshold}%` } }] }
+      },
+      // Scoring Metrics section
+      {
+        type: 'heading_2',
+        heading_2: { rich_text: [{ text: { content: 'Scoring Metrics' } }] }
+      },
+      {
+        type: 'bulleted_list_item',
+        bulleted_list_item: { rich_text: [{ text: { content: `Trend Score: ${results.trendScore} (raw: ${results.rawScore || results.trendScore})` } }] }
+      },
+      {
+        type: 'bulleted_list_item',
+        bulleted_list_item: { rich_text: [{ text: { content: `${coherenceEmoji} Coherence: ${results.coherenceScore || 'N/A'} (${results.coherenceLevel || 'Unknown'})` } }] }
+      },
+      {
+        type: 'bulleted_list_item',
+        bulleted_list_item: { rich_text: [{ text: { content: `Confidence: ${((results.confidence || 0) * 100).toFixed(0)}%` } }] }
+      },
+      {
+        type: 'bulleted_list_item',
+        bulleted_list_item: { rich_text: [{ text: { content: `Change: ${results.changePercent}%` } }] }
+      },
+    ];
+
+    // Add Score Factors if available
+    if (results.factors) {
+      children.push({
+        type: 'heading_3',
+        heading_3: { rich_text: [{ text: { content: 'Score Factors' } }] }
+      });
+      children.push({
+        type: 'paragraph',
+        paragraph: { rich_text: [{ text: { content: `Velocity: ${results.factors.velocity} | Momentum: ${results.factors.momentum} | Relevance: ${results.factors.relevance} | Authority: ${results.factors.authority} | Recency: ${results.factors.recency}` } }] }
+      });
+    }
+
+    // Data Sources Checked section
+    children.push({
+      type: 'heading_2',
+      heading_2: { rich_text: [{ text: { content: 'Data Sources Checked' } }] }
+    });
+    children.push({
+      type: 'bulleted_list_item',
+      bulleted_list_item: { rich_text: [{ text: { content: `Google Trends RSS (${GOOGLE_TRENDS_REGIONS.join(', ')})` } }] }
+    });
+    children.push({
+      type: 'bulleted_list_item',
+      bulleted_list_item: { rich_text: [{ text: { content: `Google News RSS (direct)` } }] }
+    });
+    if (process.env.NEWSDATA_API_KEY) {
+      children.push({
+        type: 'bulleted_list_item',
+        bulleted_list_item: { rich_text: [{ text: { content: 'NewsData.io API' } }] }
+      });
+    }
+    if (process.env.SERPAPI_KEY) {
+      children.push({
+        type: 'bulleted_list_item',
+        bulleted_list_item: { rich_text: [{ text: { content: 'SerpAPI Google News' } }] }
+      });
+    }
+
+    // Region data
+    if (results.regions_data) {
+      children.push({
+        type: 'paragraph',
+        paragraph: { rich_text: [{ text: { content: `Regions: ${results.regions_data}` } }] }
+      });
+    }
+
+    // Top Related Articles section
+    children.push({
+      type: 'heading_2',
+      heading_2: { rich_text: [{ text: { content: 'Top Related Articles' } }] }
+    });
+
+    // Parse and add articles
+    const articlesText = results.top_articles || results.articles || 'No articles found';
+    const articleLines = articlesText.split('\n').filter(line => line.trim());
+
+    if (articleLines.length > 0 && articleLines[0] !== 'No articles found') {
+      for (const line of articleLines.slice(0, 5)) {
+        // Check if it's a markdown link format [title](url)
+        const linkMatch = line.match(/\[([^\]]+)\]\(([^)]+)\)/);
+        if (linkMatch) {
+          children.push({
+            type: 'bulleted_list_item',
+            bulleted_list_item: {
+              rich_text: [{
+                text: {
+                  content: linkMatch[1],
+                  link: { url: linkMatch[2] }
+                }
+              }]
+            }
+          });
+        } else {
+          // Plain text article
+          children.push({
+            type: 'bulleted_list_item',
+            bulleted_list_item: { rich_text: [{ text: { content: line.replace(/^- /, '') } }] }
+          });
+        }
+      }
+    } else {
+      children.push({
+        type: 'paragraph',
+        paragraph: { rich_text: [{ text: { content: 'No related articles found for the monitored terms.' } }] }
+      });
+    }
+
+    // Summary section
+    children.push({
+      type: 'heading_2',
+      heading_2: { rich_text: [{ text: { content: 'Summary' } }] }
+    });
+    children.push({
+      type: 'paragraph',
+      paragraph: { rich_text: [{ text: { content: results.summary || 'No summary available.' } }] }
+    });
+
+    // Append all blocks to the page
+    await notionRequest(() => notion.blocks.children.append({
+      block_id: pageId,
+      children,
+    }));
+
+    return true;
+  } catch (error) {
+    console.error(`  Warning: Error updating page content: ${error.message}`);
+    return false;
+  }
+}
+
 // ============================================================================
 // TREND DATA SOURCES (copied from trend-monitor.js)
 // ============================================================================
@@ -433,6 +652,61 @@ async function fetchGoogleNews(searchTerms) {
   }
 
   return results;
+}
+
+/**
+ * Fetch Google News RSS feed directly (FREE - no API key required)
+ * Uses Google News RSS search endpoint with recency weighting
+ * Endpoint: https://news.google.com/rss/search?q={searchTerms}&hl=en-US&gl=US&ceid=US:en
+ */
+async function fetchGoogleNewsRSS(searchTerms) {
+  const parser = new Parser({
+    timeout: FETCH_TIMEOUT_MS,
+    headers: { 'User-Agent': 'Mozilla/5.0 (compatible; TrendMonitor/1.0)' }
+  });
+
+  const results = [];
+
+  for (const term of searchTerms.slice(0, 5)) {
+    try {
+      const encodedTerm = encodeURIComponent(term);
+      const url = `https://news.google.com/rss/search?q=${encodedTerm}&hl=en-US&gl=US&ceid=US:en`;
+      const feed = await parser.parseURL(url);
+
+      const articles = (feed.items || []).slice(0, 10).map(item => ({
+        title: item.title || '',
+        link: item.link || '',
+        pubDate: item.pubDate || item.isoDate || null,
+        source: item.source || extractSourceFromTitle(item.title),
+        recencyWeight: calculateRecencyWeight(item.pubDate || item.isoDate),
+      }));
+
+      const weightedCount = articles.reduce((sum, a) => sum + a.recencyWeight, 0);
+
+      results.push({
+        term,
+        articles,
+        totalResults: articles.length,
+        weightedCount,
+      });
+
+      await sleep(500); // Rate limit between terms
+    } catch (error) {
+      console.error(`  Google News RSS error for "${term}": ${error.message}`);
+    }
+  }
+
+  return results;
+}
+
+/**
+ * Extract source name from Google News RSS title
+ * Google News RSS titles often end with " - Source Name"
+ */
+function extractSourceFromTitle(title) {
+  if (!title) return 'Unknown';
+  const match = title.match(/ - ([^-]+)$/);
+  return match ? match[1].trim() : 'Unknown';
 }
 
 // ============================================================================
@@ -735,12 +1009,19 @@ async function analyzeMonitorTrends(monitor) {
   console.log(`\n  Analyzing: ${monitor.monitorId}`);
   console.log(`  Terms: ${monitor.terms.join(', ')}`);
 
-  // Fetch data from multiple sources
-  const [googleTrends, newsData, serpResults] = await Promise.all([
+  // Fetch data from multiple sources (including Google News RSS)
+  const [googleTrends, newsData, serpResults, googleNewsRSS] = await Promise.all([
     fetchGoogleTrendsRSS(monitor.terms),
     fetchNewsVolume(monitor.terms),
     fetchGoogleNews(monitor.terms),
+    fetchGoogleNewsRSS(monitor.terms),
   ]);
+
+  // Log Google News RSS results
+  if (googleNewsRSS && googleNewsRSS.length > 0) {
+    const totalGoogleNewsArticles = googleNewsRSS.reduce((sum, r) => sum + r.totalResults, 0);
+    console.log(`  Google News RSS: ${totalGoogleNewsArticles} articles found`);
+  }
 
   // Log region data
   if (googleTrends.regionData) {
@@ -770,38 +1051,58 @@ async function analyzeMonitorTrends(monitor) {
   }
 
   // Build context data for Notion properties
-  // Top 3 articles with URLs
+  // Top 5 articles with URLs (prioritize Google News RSS, then NewsData, then SerpAPI)
   const topArticles = [];
-  if (newsData && newsData.length > 0) {
-    for (const result of newsData) {
+
+  // First, collect from Google News RSS (free, direct access)
+  if (googleNewsRSS && googleNewsRSS.length > 0) {
+    for (const result of googleNewsRSS) {
       for (const article of (result.articles || []).slice(0, 3)) {
         if (article.title && article.link) {
-          topArticles.push(`${article.title}: ${article.link}`);
+          topArticles.push(`[${article.title}](${article.link})`);
         } else if (article.title) {
           topArticles.push(article.title);
         }
-        if (topArticles.length >= 3) break;
+        if (topArticles.length >= 5) break;
       }
-      if (topArticles.length >= 3) break;
+      if (topArticles.length >= 5) break;
     }
   }
-  if (topArticles.length < 3 && serpResults && serpResults.length > 0) {
+
+  // Then from NewsData if needed
+  if (topArticles.length < 5 && newsData && newsData.length > 0) {
+    for (const result of newsData) {
+      for (const article of (result.articles || []).slice(0, 3)) {
+        if (article.title && article.link) {
+          topArticles.push(`[${article.title}](${article.link})`);
+        } else if (article.title) {
+          topArticles.push(article.title);
+        }
+        if (topArticles.length >= 5) break;
+      }
+      if (topArticles.length >= 5) break;
+    }
+  }
+
+  // Finally from SerpAPI if still needed
+  if (topArticles.length < 5 && serpResults && serpResults.length > 0) {
     for (const result of serpResults) {
       for (const news of (result.newsResults || []).slice(0, 3)) {
         if (news.title && news.link) {
-          topArticles.push(`${news.title}: ${news.link}`);
+          topArticles.push(`[${news.title}](${news.link})`);
         } else if (news.title) {
           topArticles.push(news.title);
         }
-        if (topArticles.length >= 3) break;
+        if (topArticles.length >= 5) break;
       }
-      if (topArticles.length >= 3) break;
+      if (topArticles.length >= 5) break;
     }
   }
 
   // Source URLs checked
   const sourceUrls = [];
   sourceUrls.push(`Google Trends RSS (${GOOGLE_TRENDS_REGIONS.join(', ')})`);
+  sourceUrls.push('Google News RSS (direct)');
   if (process.env.NEWSDATA_API_KEY) {
     sourceUrls.push('NewsData.io API');
   }
@@ -825,10 +1126,12 @@ async function analyzeMonitorTrends(monitor) {
     coherenceLevel: coherenceData.coherenceLevel,
     confidence: confidenceData.confidence,
     // Context data for Notion properties
-    top_articles: topArticles.slice(0, 3).join('\n') || 'No articles found',
+    top_articles: topArticles.slice(0, 5).join('\n') || 'No articles found',
     source_urls: sourceUrls.join(', '),
     regions_data: regionsData,
     summary: summary,
+    // Additional data for page content
+    googleNewsRSSCount: googleNewsRSS ? googleNewsRSS.reduce((sum, r) => sum + r.totalResults, 0) : 0,
   };
 }
 
@@ -864,8 +1167,13 @@ async function main() {
   // Show available data sources
   console.log('Data Sources:');
   console.log(`  - Google Trends RSS: Available (regions: ${GOOGLE_TRENDS_REGIONS.join(', ')})`);
+  console.log(`  - Google News RSS: Available (direct, no API key required)`);
   console.log(`  - NewsData.io: ${process.env.NEWSDATA_API_KEY ? 'Configured' : 'Not configured'}`);
   console.log(`  - SerpAPI: ${process.env.SERPAPI_KEY ? 'Configured' : 'Not configured'}`);
+  console.log('');
+  console.log('Page Content:');
+  console.log('  - Creates rich blocks with Trend Analysis Report');
+  console.log('  - Includes Monitor Details, Scoring Metrics, Data Sources, Articles, Summary');
   console.log('');
 
   try {
@@ -908,7 +1216,7 @@ async function main() {
         // Analyze trends
         const trendData = await analyzeMonitorTrends(monitor);
 
-        // Update scores in Notion (WITHOUT updating last_check)
+        // Update scores in Notion (updates last_check to today)
         const success = await updateMonitorScoresOnly(
           monitor.pageId,
           monitor.monitorId,
@@ -916,6 +1224,18 @@ async function main() {
         );
 
         if (success) {
+          // Update page content with rich blocks (Trend Analysis Report)
+          const contentSuccess = await updatePageContent(
+            monitor.pageId,
+            monitor.monitorId,
+            monitor,
+            trendData
+          );
+
+          if (contentSuccess) {
+            console.log(`  Page content updated with rich blocks`);
+          }
+
           updated++;
           console.log(`  Updated successfully`);
         } else {
