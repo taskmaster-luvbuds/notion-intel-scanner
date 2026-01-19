@@ -52,9 +52,10 @@ const FETCH_TIMEOUT_MS = 10000;
 
 // Source Reliability Weights
 const SOURCE_WEIGHTS = {
-  googleTrends: { reliability: 0.85, weight: 0.35 },
-  newsData: { reliability: 0.80, weight: 0.35 },
-  serpApi: { reliability: 0.90, weight: 0.30 },
+  googleTrends: { reliability: 0.85, weight: 0.25 },
+  googleNewsRss: { reliability: 0.80, weight: 0.25 },
+  newsData: { reliability: 0.80, weight: 0.25 },
+  serpApi: { reliability: 0.90, weight: 0.25 },
 };
 
 // Multi-region configuration for Google Trends
@@ -389,7 +390,7 @@ async function updatePageContent(pageId, monitorId, monitor, results) {
       },
       {
         type: 'bulleted_list_item',
-        bulleted_list_item: { rich_text: [{ text: { content: `Confidence: ${((results.confidence || 0) * 100).toFixed(0)}%` } }] }
+        bulleted_list_item: { rich_text: [{ text: { content: `Confidence: ${results.confidence || 0}%` } }] }
       },
       {
         type: 'bulleted_list_item',
@@ -815,15 +816,27 @@ function calculateCoherenceScore(googleTrends, newsData, serpResults) {
   };
 }
 
-function calculateConfidenceV2(googleTrends, newsData, serpResults, coherenceScore) {
+function calculateConfidenceV2(googleTrends, googleNewsRss, newsData, serpResults, coherenceScore) {
   let baseConfidence = 0;
   let dataPoints = 0;
+  const maxDataPoints = 4; // 4 possible sources
 
+  // Google Trends RSS
   if (googleTrends && googleTrends.allTrends?.length > 0) {
     baseConfidence += SOURCE_WEIGHTS.googleTrends.reliability * SOURCE_WEIGHTS.googleTrends.weight;
     dataPoints++;
   }
 
+  // Google News RSS (FREE)
+  if (googleNewsRss && googleNewsRss.length > 0) {
+    const hasArticles = googleNewsRss.some(r => r.articles?.length > 0);
+    if (hasArticles) {
+      baseConfidence += SOURCE_WEIGHTS.googleNewsRss.reliability * SOURCE_WEIGHTS.googleNewsRss.weight;
+      dataPoints++;
+    }
+  }
+
+  // NewsData.io (requires API key)
   if (newsData && newsData.length > 0) {
     const hasData = newsData.some(r => r.totalResults > 0);
     if (hasData) {
@@ -832,6 +845,7 @@ function calculateConfidenceV2(googleTrends, newsData, serpResults, coherenceSco
     }
   }
 
+  // SerpAPI (requires API key)
   if (serpResults && serpResults.length > 0) {
     const hasData = serpResults.some(r => r.totalResults > 0);
     if (hasData) {
@@ -840,15 +854,16 @@ function calculateConfidenceV2(googleTrends, newsData, serpResults, coherenceSco
     }
   }
 
-  const freshnessMultiplier = 0.4 + (0.6 * (dataPoints / 3));
-  const sampleSizeMultiplier = 0.3 + (0.7 * Math.min(1, dataPoints / 3));
+  const freshnessMultiplier = 0.4 + (0.6 * (dataPoints / maxDataPoints));
+  const sampleSizeMultiplier = 0.3 + (0.7 * Math.min(1, dataPoints / maxDataPoints));
   const agreementMultiplier = 0.75 + (0.40 * (coherenceScore / 100));
 
   let confidence = baseConfidence * freshnessMultiplier * sampleSizeMultiplier * agreementMultiplier;
   confidence = Math.min(0.98, Math.max(0.10, confidence));
 
+  // Return as percentage (0-100) for better Notion display
   return {
-    confidence: Math.round(confidence * 100) / 100,
+    confidence: Math.round(confidence * 100),
     dataPoints,
     factors: {
       freshnessMultiplier: Math.round(freshnessMultiplier * 100) / 100,
@@ -1038,8 +1053,8 @@ async function analyzeMonitorTrends(monitor) {
   // Calculate Trend Score
   const trendData = calculateTrendScoreV2(googleTrends, newsData, serpResults, monitor.monitorId);
 
-  // Calculate Confidence
-  const confidenceData = calculateConfidenceV2(googleTrends, newsData, serpResults, coherenceData.coherenceScore);
+  // Calculate Confidence (pass googleNewsRSS for proper counting)
+  const confidenceData = calculateConfidenceV2(googleTrends, googleNewsRSS, newsData, serpResults, coherenceData.coherenceScore);
 
   console.log(`  Trend Score: ${trendData.trendScore} (raw: ${trendData.rawScore})`);
   console.log(`  Change: ${trendData.changePercent}%`);

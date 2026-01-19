@@ -354,7 +354,7 @@ async function updateMonitorContent(pageId, monitor, results) {
         type: 'bulleted_list_item',
         bulleted_list_item: { rich_text: [
           { text: { content: 'Confidence: ' }, annotations: { bold: true } },
-          { text: { content: `${Math.round(results.confidence * 100)}%` } }
+          { text: { content: `${results.confidence}%` } }
         ] }
       },
       {
@@ -659,7 +659,7 @@ async function createAlert(monitor, trendData) {
         },
         {
           type: 'bulleted_list_item',
-          bulleted_list_item: { rich_text: [{ text: { content: `Confidence: ${(trendData.confidence * 100).toFixed(0)}%` } }] }
+          bulleted_list_item: { rich_text: [{ text: { content: `Confidence: ${trendData.confidence}%` } }] }
         },
         {
           type: 'bulleted_list_item',
@@ -1124,8 +1124,9 @@ function calculateConfidenceV2(googleTrends, googleNewsRss, newsData, serpResult
   // Clamp to valid range
   confidence = Math.min(0.98, Math.max(0.10, confidence));
 
+  // Return as percentage (0-100) for better Notion display
   return {
-    confidence: Math.round(confidence * 100) / 100,
+    confidence: Math.round(confidence * 100),
     dataPoints,
     factors: {
       freshnessMultiplier: Math.round(freshnessMultiplier * 100) / 100,
