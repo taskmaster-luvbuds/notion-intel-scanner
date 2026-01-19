@@ -461,7 +461,7 @@ async function fetchGoogleTrendsRSS(searchTerms, regions = GOOGLE_TRENDS_REGIONS
 
   for (const geo of regions) {
     try {
-      const url = `https://trends.google.com/trends/trendingsearches/daily/rss?geo=${geo}`;
+      const url = `https://trends.google.com/trending/rss?geo=${geo}`;
       const feed = await parser.parseURL(url);
 
       const trendingTopics = feed.items.map(item => ({
