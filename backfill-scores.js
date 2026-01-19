@@ -203,23 +203,27 @@ async function fetchAllActiveMonitors() {
 }
 
 /**
- * Update monitor scores in Notion WITHOUT updating last_check
- * This is the key difference from the regular updateMonitor function
+ * Update monitor scores in Notion AND update last_check
  */
 async function updateMonitorScoresOnly(pageId, monitorId, results) {
+  const today = new Date().toISOString().split('T')[0];
+
   if (DRY_RUN) {
     console.log(`  [DRY RUN] Would update ${monitorId} with:`);
     console.log(`    - trend_score: ${results.trendScore}`);
     console.log(`    - Coherency: ${results.coherenceScore}`);
     console.log(`    - confidence: ${results.confidence}`);
     console.log(`    - change_percent: ${results.changePercent}`);
+    console.log(`    - last_check: ${today}`);
     return true;
   }
 
   try {
-    const properties = {};
+    const properties = {
+      'last_check': { date: { start: today } },
+    };
 
-    // Only add score properties - NOT last_check
+    // Add score properties
     if (results.trendScore !== undefined) {
       properties['trend_score'] = { number: results.trendScore };
     }
@@ -758,8 +762,8 @@ async function main() {
   if (DRY_RUN) console.log('Mode: DRY RUN (no updates will be made)');
   if (process.env.VERBOSE === 'true') console.log('Mode: VERBOSE (detailed factor breakdowns)');
   console.log('');
-  console.log('NOTE: This script does NOT update last_check dates.');
-  console.log('      Regular scheduling will not be affected.');
+  console.log('NOTE: This script updates last_check dates to today.');
+  console.log('      All monitors will show as freshly checked.');
   console.log('');
 
   // Validate environment
