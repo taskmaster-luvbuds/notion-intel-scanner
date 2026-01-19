@@ -247,7 +247,7 @@ async function fetchActiveMonitors() {
 
 /**
  * Update monitor in Notion with trend results
- * Writes: last_check, trend_score, coherence, confidence
+ * Writes: last_check, trend_score, coherence, confidence, and context properties
  */
 async function updateMonitor(pageId, results) {
   if (DRY_RUN) {
@@ -255,6 +255,10 @@ async function updateMonitor(pageId, results) {
     console.log(`    - trend_score: ${results.trendScore}`);
     console.log(`    - coherence: ${results.coherenceScore}`);
     console.log(`    - confidence: ${results.confidence}`);
+    console.log(`    - top_articles: ${results.topArticles ? results.topArticles.substring(0, 50) + '...' : '(none)'}`);
+    console.log(`    - source_urls: ${results.sourceUrls ? results.sourceUrls.split('\n').length + ' URLs' : '(none)'}`);
+    console.log(`    - regions_data: ${results.regionsData || '(none)'}`);
+    console.log(`    - summary: ${results.contextSummary || '(none)'}`);
     return true;
   }
 
@@ -280,6 +284,28 @@ async function updateMonitor(pageId, results) {
       properties['change_percent'] = { number: results.changePercent };
     }
 
+    // Add context properties (Rich Text) - truncate to stay within Notion limits
+    if (results.topArticles) {
+      properties['top_articles'] = {
+        rich_text: [{ text: { content: results.topArticles.substring(0, MAX_CONTENT_LENGTH) } }]
+      };
+    }
+    if (results.sourceUrls) {
+      properties['source_urls'] = {
+        rich_text: [{ text: { content: results.sourceUrls.substring(0, MAX_CONTENT_LENGTH) } }]
+      };
+    }
+    if (results.regionsData) {
+      properties['regions_data'] = {
+        rich_text: [{ text: { content: results.regionsData.substring(0, MAX_CONTENT_LENGTH) } }]
+      };
+    }
+    if (results.contextSummary) {
+      properties['summary'] = {
+        rich_text: [{ text: { content: results.contextSummary.substring(0, MAX_CONTENT_LENGTH) } }]
+      };
+    }
+
     await notionRequest(() => notion.pages.update({
       page_id: pageId,
       properties,
@@ -288,12 +314,18 @@ async function updateMonitor(pageId, results) {
   } catch (error) {
     // If property doesn't exist, log warning with details
     if (error.message?.includes('property does not exist') || error.code === 'validation_error') {
-      console.error(`  Warning: Some score properties may not exist in your Notion database.`);
-      console.error(`  Please add these Number properties to your Trend Monitors database:`);
-      console.error(`    - trend_score (Number) - stores the calculated trend score 0-100`);
-      console.error(`    - Coherency (Number) - stores the coherence score 0-100`);
-      console.error(`    - confidence (Number) - stores the confidence 0.0-1.0`);
-      console.error(`    - change_percent (Number) - stores the % change from previous`);
+      console.error(`  Warning: Some properties may not exist in your Notion database.`);
+      console.error(`  Please add these properties to your Trend Monitors database:`);
+      console.error(`    Number properties:`);
+      console.error(`      - trend_score (Number) - stores the calculated trend score 0-100`);
+      console.error(`      - Coherency (Number) - stores the coherence score 0-100`);
+      console.error(`      - confidence (Number) - stores the confidence 0.0-1.0`);
+      console.error(`      - change_percent (Number) - stores the % change from previous`);
+      console.error(`    Rich Text properties:`);
+      console.error(`      - top_articles (Rich Text) - top 3 article links`);
+      console.error(`      - source_urls (Rich Text) - URLs checked`);
+      console.error(`      - regions_data (Rich Text) - region match summary`);
+      console.error(`      - summary (Rich Text) - what was found`);
       console.error(`  Error: ${error.message}`);
     } else {
       console.error(`  Warning: Error updating monitor: ${error.message}`);
@@ -994,6 +1026,73 @@ async function analyzeMonitorTrends(monitor) {
     console.log(`  Coherence Factors: Dir=${coherenceData.factors.directionAgreement} Mag=${coherenceData.factors.magnitudeConsistency} Temp=${coherenceData.factors.temporalConsistency} Term=${coherenceData.factors.termCorrelation}`);
   }
 
+  // === Collect article context for storage ===
+
+  // Collect top articles with URLs (prefer NewsData, fallback to SerpAPI)
+  const topArticles = [];
+  const sourceUrls = new Set();
+
+  // Collect from NewsData
+  if (newsData && newsData.length > 0) {
+    for (const result of newsData) {
+      for (const article of (result.articles || [])) {
+        if (article.title && article.link) {
+          topArticles.push({ title: article.title, url: article.link, source: 'NewsData' });
+          sourceUrls.add(article.link);
+        }
+      }
+    }
+  }
+
+  // Collect from SerpAPI (Google News)
+  if (serpResults && serpResults.length > 0) {
+    for (const result of serpResults) {
+      for (const news of (result.newsResults || [])) {
+        if (news.title && news.link) {
+          topArticles.push({ title: news.title, url: news.link, source: 'SerpAPI' });
+          sourceUrls.add(news.link);
+        }
+      }
+    }
+  }
+
+  // Format top 3 articles as markdown links
+  const topArticlesFormatted = topArticles
+    .slice(0, 3)
+    .map(a => `[${a.title}](${a.url})`)
+    .join('\n');
+
+  // Format regions data
+  const regionsData = googleTrends.regionData
+    ? Object.entries(googleTrends.regionData)
+        .map(([region, data]) => `${region}:${data.matches}`)
+        .join(', ')
+    : '';
+
+  // Build summary text
+  const trendMatchCount = googleTrends.matchingTrends?.length || 0;
+  const newsDataArticleCount = newsData
+    ? newsData.reduce((sum, r) => sum + (r.articles?.length || 0), 0)
+    : 0;
+  const serpArticleCount = serpResults
+    ? serpResults.reduce((sum, r) => sum + (r.newsResults?.length || 0), 0)
+    : 0;
+
+  const summaryParts = [];
+  if (trendMatchCount > 0) {
+    summaryParts.push(`Found ${trendMatchCount} matching trend${trendMatchCount > 1 ? 's' : ''} in Google Trends`);
+  }
+  if (newsDataArticleCount > 0) {
+    summaryParts.push(`${newsDataArticleCount} related article${newsDataArticleCount > 1 ? 's' : ''} from NewsData`);
+  }
+  if (serpArticleCount > 0) {
+    summaryParts.push(`${serpArticleCount} article${serpArticleCount > 1 ? 's' : ''} from Google News`);
+  }
+  if (summaryParts.length === 0) {
+    summaryParts.push('No matching trends or articles found');
+  }
+  const contextSummary = summaryParts.join('. ') + '.';
+
   return {
     ...trendData,
     coherenceScore: coherenceData.coherenceScore,
@@ -1002,6 +1101,11 @@ async function analyzeMonitorTrends(monitor) {
     confidence: confidenceData.confidence,
     confidenceFactors: confidenceData.factors,
     summary: `${monitor.terms[0] || 'Unknown'}: Score ${trendData.trendScore}, Coherence ${coherenceData.coherenceScore} (${coherenceData.coherenceLevel}), Change ${trendData.changePercent}%`,
+    // New context properties
+    topArticles: topArticlesFormatted,
+    sourceUrls: Array.from(sourceUrls).slice(0, 10).join('\n'),
+    regionsData,
+    contextSummary,
   };
 }
 
