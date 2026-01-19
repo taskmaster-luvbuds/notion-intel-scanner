@@ -7,7 +7,9 @@
     "scan": "node scanner.js",
     "test": "node scanner.js --dry-run",
     "trends": "node trend-monitor.js",
-    "trends:test": "node trend-monitor.js --dry-run"
+    "trends:test": "node trend-monitor.js --dry-run",
+    "backfill": "node backfill-scores.js",
+    "backfill:test": "node backfill-scores.js --dry-run"
   },
   "dependencies": {
     "@notionhq/client": "^2.2.14",

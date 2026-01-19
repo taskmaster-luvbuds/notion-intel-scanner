@@ -2,8 +2,8 @@ name: Trend Monitor Scan
 
 on:
   schedule:
-    # Weekly scan on Mondays at 7 AM UTC (11 PM PST Sunday)
-    - cron: '0 7 * * 1'
+    # Daily scan at 7 AM UTC (11 PM PST previous day)
+    - cron: '0 7 * * *'
   workflow_dispatch:
     inputs:
       dry_run:
